@@ -65,6 +65,7 @@ ROLE_SECTIONS = {
             "Receiving Slips",
             "Vendors",
             "Gateway Pass Review",
+            "Post-Payment Closure",
             "Availability / Away Notice",
             "Procurement Documents",
             "Procurement Reports",
@@ -361,7 +362,7 @@ def attention_count_for_section(current: dict, section: str) -> int:
             "Admin Dashboard": ("SELECT COUNT(*) FROM user_availability WHERE (admin_review_status='Pending Review' OR status IN ('Away Requested','Away Active')) AND datetime(COALESCE(updated_at, created_at)) > datetime(?)", ()),
             "Notifications Monitor": ("SELECT COUNT(*) FROM notification_outbox WHERE status IN ('Queued','Fallback') AND datetime(created_at) > datetime(?)", ()),
             "Availability & Delegation Requests": ("SELECT COUNT(*) FROM user_availability WHERE (admin_review_status='Pending Review' OR status='Away Requested') AND datetime(COALESCE(updated_at, created_at)) > datetime(?)", ()),
-            "Gateway Pass Management": ("SELECT COUNT(*) FROM gateway_passes WHERE status IN ('Submitted','Pending Procurement Manager / Approver Review') AND datetime(COALESCE(updated_at, created_at)) > datetime(?)", ()),
+            "Gateway Pass Management": ("SELECT COUNT(*) FROM gateway_passes WHERE status IN ('Sent for Procurement Review','Submitted','Submitted for Approval','Pending Approval','Pending Procurement Manager / Approver Review') AND datetime(COALESCE(updated_at, created_at)) > datetime(?)", ()),
             "Audit Logs": ("SELECT COUNT(*) FROM audit_logs WHERE action IN ('LOGIN','LOGOUT','PASSWORD_RESET','ROLE_CHANGE') AND datetime(created_at) > datetime(?)", ()),
         }
         value = mapping.get(section)
@@ -370,22 +371,19 @@ def attention_count_for_section(current: dict, section: str) -> int:
     elif role == "Procurement Manager":
         mapping = {
             "Utility Head / Facility Head Inbox": ("SELECT COUNT(*) FROM purchase_requests WHERE (status IN ('Sent for Procurement Review','Submitted to Procurement Manager') OR next_role='procurement_manager') AND datetime(COALESCE(updated_at, created_at)) > datetime(?)", ()),
-            "Gateway Pass Review": ("SELECT COUNT(*) FROM gateway_passes gp WHERE gp.status IN ('Submitted','Pending Procurement Manager / Approver Review') AND datetime(COALESCE(gp.updated_at, gp.created_at)) > datetime(?) AND EXISTS (SELECT 1 FROM facility_manager_links fml WHERE fml.facility_manager_user_id=gp.facility_manager_user_id AND fml.procurement_manager_user_id=? AND fml.is_active=1)", (uid,)),
+            "Gateway Pass Review": ("SELECT COUNT(*) FROM gateway_passes gp WHERE (gp.status IN ('Sent for Procurement Review','Submitted','Submitted for Approval','Pending Approval','Pending Procurement Manager / Approver Review') OR gp.next_role IN ('procurement_manager','approver')) AND datetime(COALESCE(gp.updated_at, gp.created_at)) > datetime(?)", ()),
+            "Post-Payment Closure": ("SELECT COUNT(*) FROM purchase_requests WHERE (status IN ('Paid','Receipt Uploaded','Payment Submitted for Verification','Completed','Closed') OR (next_role='procurement_manager' AND payment_status='Paid')) AND datetime(COALESCE(updated_at, created_at)) > datetime(?)", ()),
             "Purchase Requests": ("SELECT COUNT(*) FROM purchase_requests WHERE status IN ('Submitted','Procurement Review','Requires Sourcing','Vendor Quote Collection','Approved') AND datetime(COALESCE(updated_at, created_at)) > datetime(?)", ()),
             "Availability / Away Notice": ("SELECT COUNT(*) FROM user_availability WHERE user_id=? AND status NOT IN ('Returned','Cancelled') AND datetime(COALESCE(updated_at, created_at)) > datetime(?)", (uid,)),
         }
         value = mapping.get(section)
         if value:
-            # Gateway Pass Review has the timestamp placeholder before uid.
-            if section == "Gateway Pass Review":
-                count = _nav_count_query(value[0], (seen_at, uid))
-            else:
-                count = _count_since(value[0], value[1], seen_at)
+            count = _count_since(value[0], value[1], seen_at)
     elif role == "Facility Manager":
         mapping = {
             "My Draft Requests": ("SELECT COUNT(*) FROM purchase_requests WHERE facility_manager_user_id=? AND status IN ('FM Draft','Returned to Facility Manager') AND datetime(COALESCE(updated_at, created_at)) > datetime(?)", (uid,)),
             "Submit to Procurement Manager": ("SELECT COUNT(*) FROM purchase_requests WHERE facility_manager_user_id=? AND status IN ('FM Draft','Returned to Facility Manager') AND datetime(COALESCE(updated_at, created_at)) > datetime(?)", (uid,)),
-            "Gateway Pass": ("SELECT COUNT(*) FROM gateway_passes WHERE facility_manager_user_id=? AND status IN ('Approved','Returned for Correction') AND datetime(COALESCE(updated_at, created_at)) > datetime(?)", (uid,)),
+            "Gateway Pass": ("SELECT COUNT(*) FROM gateway_passes WHERE facility_manager_user_id=? AND status IN ('Approved','Generated','Downloaded','Returned for Correction','Returned') AND datetime(COALESCE(updated_at, created_at)) > datetime(?)", (uid,)),
             "Returned Requests": ("SELECT COUNT(*) FROM purchase_requests WHERE facility_manager_user_id=? AND status='Returned to Facility Manager' AND datetime(COALESCE(updated_at, created_at)) > datetime(?)", (uid,)),
             "Approved / Accepted Requests": ("SELECT COUNT(*) FROM purchase_requests WHERE facility_manager_user_id=? AND status IN ('Accepted by Procurement Manager','Approved','Paid','Closed') AND datetime(COALESCE(updated_at, created_at)) > datetime(?)", (uid,)),
         }
@@ -407,7 +405,7 @@ def attention_count_for_section(current: dict, section: str) -> int:
             "Pending Approvals": ("SELECT COUNT(*) FROM purchase_requests WHERE status IN ('Pending Approval','Pending Approver/MD Approval') AND datetime(COALESCE(updated_at, created_at)) > datetime(?)", ()),
             "PO Approval": ("SELECT COUNT(*) FROM purchase_orders WHERE status='Pending Approval' AND datetime(COALESCE(updated_at, created_at)) > datetime(?)", ()),
             "Payment Approval": ("SELECT COUNT(*) FROM payments WHERE status='Pending Approval' AND datetime(COALESCE(updated_at, created_at)) > datetime(?)", ()),
-            "Gateway Pass Approval": ("SELECT COUNT(*) FROM gateway_passes WHERE status IN ('Submitted','Pending Procurement Manager / Approver Review') AND datetime(COALESCE(updated_at, created_at)) > datetime(?)", ()),
+            "Gateway Pass Approval": ("SELECT COUNT(*) FROM gateway_passes WHERE status IN ('Sent for Procurement Review','Submitted','Submitted for Approval','Pending Approval','Pending Procurement Manager / Approver Review') AND datetime(COALESCE(updated_at, created_at)) > datetime(?)", ()),
             "Availability / Away Notice": ("SELECT COUNT(*) FROM user_availability WHERE user_id=? AND status NOT IN ('Returned','Cancelled') AND datetime(COALESCE(updated_at, created_at)) > datetime(?)", (uid,)),
         }
         value = mapping.get(section)
@@ -420,6 +418,7 @@ def attention_count_for_section(current: dict, section: str) -> int:
             "Delegated Approval Review": ("SELECT COUNT(*) FROM approval_delegations WHERE enabled=1 AND datetime(COALESCE(updated_at, created_at)) > datetime(?)", ()),
             "Budget Audit": ("SELECT COUNT(*) FROM budget_history WHERE datetime(created_at) > datetime(?)", ()),
             "Audit Dashboard": ("SELECT COUNT(*) FROM audit_logs WHERE datetime(created_at) > datetime(?)", ()),
+            "Compliance Reports": ("SELECT COUNT(*) FROM notifications WHERE (role='Auditor' OR user_id=?) AND is_read=0 AND datetime(created_at) > datetime(?)", (uid,)),
         }
         value = mapping.get(section)
         if value:

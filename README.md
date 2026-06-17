@@ -353,3 +353,13 @@ Extract the project to a short path such as `C:\ProcureFlow` and avoid deeply ne
 - Purchase request and Gateway Pass dynamic line items now include both `+ Add` and `− Remove` controls with stable Streamlit keys.
 - Major workflow actions use persistent green success confirmations after rerun to reduce accidental double-click duplicate submissions.
 - Dropdowns with `Other` continue to reveal manual input boxes and save the typed value for reuse, reports, and documents.
+
+### 2026-06-17 focused workflow notification/report update
+
+- Gateway Pass returns from Procurement Manager, Approver / MD, or Admin now remain visible in the Utility Head / Facility Head `Drafts / Returned` Gateway Pass section for correction and resubmission.
+- Gateway Pass review routing now creates notifications and red sidebar badge targets for Procurement Manager, Approver / MD, Admin, Utility Head / Facility Head, and Auditor where relevant.
+- Approved Gateway Passes now notify the Utility Head / Facility Head and unlock the `Ready to Generate` interface without changing the preserved professional PDF template.
+- Finance payment completion now leaves the request as `Paid` and routes the final operational closure task to Procurement Manager.
+- Procurement Manager now has a `Post-Payment Closure` section to mark paid records as `Completed`, then `Closed`, then `Archived`.
+- Auditor dashboard now includes recent activity notifications in addition to the audit log and report views.
+- Downloads now support three formats across report/download surfaces: Excel `.xlsx`, PDF `.pdf`, and CSV `.csv`. The selected format is generated only on demand to keep tab navigation fast.

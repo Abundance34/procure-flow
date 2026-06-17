@@ -205,6 +205,37 @@ def log_audit(
         )
 
 
+    # Auditor activity feed: every audited action creates an unread Auditor notification.
+    # This is intentionally direct SQL instead of create_notification() to avoid recursion.
+    try:
+        if action not in {"AUDITOR_ACTIVITY_NOTIFICATION_CREATED", "CRITICAL_NOTIFICATION_CREATED"}:
+            cols = table_columns("notifications")
+            section_target = "Audit Dashboard"
+            title = f"Audit activity: {action}"
+            msg = f"{role or 'System'} performed {action} on {entity_type or 'Record'} {entity_id or ''}"
+            ts = now_iso()
+            if {"popup_shown", "importance", "delivery_channel", "push_sent", "email_sent", "action_label", "section_target"}.issubset(cols):
+                run_query(
+                    """
+                    INSERT INTO notifications (user_id, role, title, message, entity_type, entity_id, is_read, popup_shown, importance, delivery_channel, push_sent, email_sent, action_label, section_target, created_at)
+                    VALUES (NULL, 'Auditor', ?, ?, ?, ?, 0, 0, 'Normal', 'in_app', 0, 0, 'Open Audit Dashboard', ?, ?)
+                    """,
+                    (title, msg, entity_type, int(entity_id) if str(entity_id or '').isdigit() else None, section_target, ts),
+                )
+            elif "section_target" in cols:
+                run_query(
+                    "INSERT INTO notifications (user_id, role, title, message, entity_type, entity_id, is_read, section_target, created_at) VALUES (NULL, 'Auditor', ?, ?, ?, ?, 0, ?, ?)",
+                    (title, msg, entity_type, int(entity_id) if str(entity_id or '').isdigit() else None, section_target, ts),
+                )
+            else:
+                run_query(
+                    "INSERT INTO notifications (user_id, role, title, message, entity_type, entity_id, is_read, created_at) VALUES (NULL, 'Auditor', ?, ?, ?, ?, 0, ?)",
+                    (title, msg, entity_type, int(entity_id) if str(entity_id or '').isdigit() else None, ts),
+                )
+    except Exception:
+        pass
+
+
 def add_workflow_event(entity_type: str, entity_id: int, event: str, status: str | None = None, note: str | None = None, user_id: int | None = None):
     run_query(
         """
@@ -1429,8 +1460,10 @@ def _infer_notification_section(target_role: str | None, title: str | None, enti
     if role == "Procurement Manager":
         if "gateway" in text:
             return "Gateway Pass Review"
-        if "facility manager" in text or "fm draft" in text:
-            return "Facility Manager Inbox"
+        if any(x in text for x in ["closure", "paid request", "post-payment", "complete, close", "archive"]):
+            return "Post-Payment Closure"
+        if "facility manager" in text or "utility head" in text or "facility head" in text or "fm draft" in text:
+            return "Utility Head / Facility Head Inbox"
         if "delegated" in text or "acting" in text:
             return "Acting Approval Queue"
         if any(x in text for x in ["away", "delegate", "availability"]):
@@ -1447,7 +1480,7 @@ def _infer_notification_section(target_role: str | None, title: str | None, enti
             return "Approved / Accepted Requests"
         if "draft" in text:
             return "My Draft Requests"
-        return "Facility Dashboard"
+        return "Utility / Facility Dashboard"
     if role == "Finance":
         if "invoice" in text:
             return "Invoices"

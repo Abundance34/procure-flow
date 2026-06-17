@@ -691,7 +691,7 @@ def request_detail(pr_id: int, actions=True, key_scope: str | None = None):
     pr = df_query("SELECT pr.*, u.full_name requested_by_name FROM purchase_requests pr LEFT JOIN users u ON pr.requested_by=u.id WHERE pr.id=?", (pr_id,)).iloc[0]
     with st.container(border=True):
         st.markdown(f"### {pr['request_no']} {badge(pr['status'])}", unsafe_allow_html=True)
-        workflow_progress(pr["status"], PR_STATUSES)
+        workflow_progress(pr["status"], _request_workflow_steps_for_status(pr["status"]))
         metric_row([("Amount", money(pr["estimated_amount"]), None), ("Priority", pr["priority"], None), ("Department", pr["department_project"], None), ("Source", pr["source_type"], None)], cols=4)
         st.write(f"**Justification:** {pr['justification']}")
         st.write(f"**Requested by:** {pr['requested_by_name']}")
@@ -3616,7 +3616,7 @@ def _gateway_approve(gateway_pass_id: int, decision: str, note: str):
         msg = f"{row['pass_number']} was returned for correction. Reason: {note}"
     run_query("INSERT INTO gateway_pass_approvals (gateway_pass_id, approver_user_id, approver_role, decision, note, created_at) VALUES (?, ?, ?, ?, ?, ?)", (gateway_pass_id, user()["id"], user()["role"], decision_label, note, now_iso()))
     log_gateway_event(gateway_pass_id, f"Gateway Pass {decision_label}", decision_label, note)
-    create_notification(int(row["facility_manager_user_id"]), None, title, msg, "Gateway Pass", gateway_pass_id, "High", ["in_app", "browser_push"], action_label="Open Gateway Pass")
+    _notify_gateway_event({**row.to_dict(), "id": gateway_pass_id}, title, msg, target="facility", importance="High")
     _rerun_success(f"Gateway pass {decision_label.lower()}.")
 
 
@@ -3948,7 +3948,7 @@ def facility_gateway_pass_page():
     elif section == "Create Draft":
         create_gateway_pass_form()
     elif section == "My Drafts":
-        gateway_pass_register("gp.facility_manager_user_id=? AND gp.status IN ('Draft','Returned for Correction')", (fm_id,), "My Gateway Pass Drafts", allow_submit=True, key_prefix="fm_gp_drafts")
+        gateway_pass_register("gp.facility_manager_user_id=? AND gp.status IN ('Draft','Returned for Correction','Returned')", (fm_id,), "My Gateway Pass Drafts", allow_submit=True, key_prefix="fm_gp_drafts")
     elif section == "Submitted":
         gateway_pass_register("gp.facility_manager_user_id=? AND gp.status IN ('Submitted','Pending Procurement Manager / Approver Review')", (fm_id,), "Submitted Gateway Passes", key_prefix="fm_gp_submitted")
     elif section == "Approved / Download":
@@ -4332,6 +4332,10 @@ def executive_workspace():
 
 def audit_dashboard():
     st.subheader("Compliance Snapshot")
+    recent_notifs = df_query("SELECT title, message, entity_type, entity_id, created_at FROM notifications WHERE role='Auditor' OR user_id=? ORDER BY created_at DESC LIMIT 25", (user()["id"],))
+    if not recent_notifs.empty:
+        st.markdown("#### Recent activity notifications")
+        dataframe(recent_notifs)
     metric_row([
         ("Gateway pass audit count", int(df_query("SELECT COUNT(*) c FROM gateway_passes").iloc[0,0]), None),
         ("Approved passes", int(df_query("SELECT COUNT(*) c FROM gateway_passes WHERE status='Approved'").iloc[0,0]), None),
@@ -5409,6 +5413,10 @@ def executive_dashboard():
 
 def audit_dashboard():
     st.subheader("Compliance Snapshot")
+    recent_notifs = df_query("SELECT title, message, entity_type, entity_id, created_at FROM notifications WHERE role='Auditor' OR user_id=? ORDER BY created_at DESC LIMIT 25", (user()["id"],))
+    if not recent_notifs.empty:
+        st.markdown("#### Recent activity notifications")
+        dataframe(recent_notifs)
     metric_row([
         ("Gateway pass audit count", int(df_query("SELECT COUNT(*) c FROM gateway_passes").iloc[0,0]), None),
         ("Approved passes", int(df_query("SELECT COUNT(*) c FROM gateway_passes WHERE status='Approved'").iloc[0,0]), None),
@@ -5878,6 +5886,7 @@ def invoices_page():
 # These final definitions intentionally override earlier MVP/phase functions.
 # ============================================================================
 from io import BytesIO
+import csv
 from core.permissions import (
     display_role, can_approve, can_pay, can_create_payment_request,
     can_delete_draft, can_edit_own_draft, is_read_only,
@@ -5896,6 +5905,21 @@ PR_STATUSES = [
     "Payment Submitted for Verification", "Completed", "Closed", "Archived",
 ]
 GATEWAY_DEPARTMENTS = ["CMOTD", "RACAM"]
+
+
+def _request_workflow_steps_for_status(status: str) -> list[str]:
+    """Keep the status rail focused on the user's actionable chain.
+
+    Facility/Utility users should not see confusing post-payment steps they
+    cannot action. Procurement Manager/Admin/Auditor can see the final
+    Paid -> Completed -> Closed -> Archived chain.
+    """
+    base = ["Draft", "Sent for Procurement Review", "Reviewed by Procurement", "Submitted for Approval", "Approved", "Awaiting Payment", "Paid"]
+    closure = ["Completed", "Closed", "Archived"]
+    role = _current_role() if "user" in globals() and "user" in st.session_state else ""
+    if role in ["Procurement Manager", "Admin", "Auditor"] or status in ["Completed", "Closed", "Archived"]:
+        return base + closure
+    return base
 
 
 def _current_role() -> str:
@@ -5922,10 +5946,14 @@ def _next_role_for_status(status: str) -> str | None:
         "Approved": "finance",
         "Awaiting Payment": "finance",
         "Approved for Payment": "finance",
-        "Paid": "auditor",
-        "Receipt Uploaded": "auditor",
-        "Completed": "auditor",
-        "Closed": "auditor",
+        # After Finance records payment/receipt, Procurement Manager owns
+        # final operational closure: Completed -> Closed -> Archived.
+        "Paid": "procurement_manager",
+        "Receipt Uploaded": "procurement_manager",
+        "Payment Submitted for Verification": "procurement_manager",
+        "Completed": "procurement_manager",
+        "Closed": "procurement_manager",
+        "Archived": "auditor",
     }.get(status)
 
 
@@ -5940,31 +5968,112 @@ def _set_next_role(entity_table: str, entity_id: int, status: str):
         pass
 
 
+def _normalise_report_name(name: str) -> str:
+    return str(name or "report").replace(" ", "_").replace("/", "_").replace("\\", "_").lower()
+
+
+def _csv_bytes_from_sheets(sheets: dict[str, pd.DataFrame]) -> bytes:
+    frames = []
+    for sheet_name, df in (sheets or {}).items():
+        data = df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame(df)
+        if data.empty:
+            data = pd.DataFrame([{"message": "No records"}])
+        data.insert(0, "sheet", str(sheet_name))
+        frames.append(data)
+    combined = pd.concat(frames, ignore_index=True, sort=False) if frames else pd.DataFrame([{"message": "No records"}])
+    return combined.to_csv(index=False).encode("utf-8-sig")
+
+
+def _pdf_bytes_from_sheets(sheets: dict[str, pd.DataFrame], title: str) -> bytes:
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import mm
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
+    out = BytesIO()
+    doc = SimpleDocTemplate(out, pagesize=landscape(A4), rightMargin=10*mm, leftMargin=10*mm, topMargin=10*mm, bottomMargin=10*mm)
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle("pf_pdf_title", parent=styles["Title"], fontSize=14, leading=16, spaceAfter=8)
+    heading_style = ParagraphStyle("pf_pdf_heading", parent=styles["Heading2"], fontSize=11, leading=13, spaceBefore=8, spaceAfter=5)
+    small = ParagraphStyle("pf_pdf_small", parent=styles["Normal"], fontSize=6.8, leading=8)
+    story = [Paragraph(str(title).replace("_", " ").title(), title_style)]
+    items = list((sheets or {}).items()) or [("Detailed Records", pd.DataFrame())]
+    for sheet_idx, (sheet_name, df) in enumerate(items):
+        if sheet_idx:
+            story.append(PageBreak())
+        data = df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame(df)
+        story.append(Paragraph(str(sheet_name), heading_style))
+        if data.empty:
+            story.append(Paragraph("No records available.", small))
+            continue
+        source_rows, source_cols = len(data), len(data.columns)
+        data = data.fillna("").astype(str).iloc[:60, :8]
+        table_data = [[Paragraph(str(c), small) for c in data.columns]]
+        for row in data.itertuples(index=False):
+            table_data.append([Paragraph(str(v), small) for v in row])
+        width = 277 * mm
+        col_count = max(1, len(table_data[0]))
+        tbl = Table(table_data, colWidths=[width / col_count] * col_count, repeatRows=1)
+        tbl.setStyle(TableStyle([
+            ("GRID", (0,0), (-1,-1), .25, colors.lightgrey),
+            ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#e2e8f0")),
+            ("VALIGN", (0,0), (-1,-1), "TOP"),
+            ("PADDING", (0,0), (-1,-1), 3),
+        ]))
+        story.append(tbl)
+        if source_rows > 60 or source_cols > 8:
+            story.append(Spacer(1, 5))
+            story.append(Paragraph("PDF preview is limited for readability. Use Excel or CSV for full details.", small))
+    doc.build(story)
+    return out.getvalue()
+
+
+def report_download_buttons(sheets: dict[str, pd.DataFrame], name: str, key: str):
+    """Render Excel, PDF and CSV downloads for every role/report surface.
+
+    The payload is generated only for the selected format, so opening tabs stays
+    fast even when the report tables are large.
+    """
+    if not sheets:
+        return
+    clean_name = _normalise_report_name(name)
+    safe_sheets: dict[str, pd.DataFrame] = {}
+    for sheet_name, df in sheets.items():
+        data = df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame(df)
+        safe_sheets[str(sheet_name)] = _redact_ui_df(data, clean_name) if "_redact_ui_df" in globals() else data
+    format_choice = st.selectbox(
+        f"Download format for {name.replace('_', ' ').title()}",
+        ["Excel (.xlsx)", "PDF (.pdf)", "CSV (.csv)"],
+        key=f"{key}_format",
+        label_visibility="collapsed",
+    )
+    if format_choice.startswith("Excel"):
+        payload = build_excel_workbook(safe_sheets, clean_name)
+        mime = excel_mime(); ext = "xlsx"; action = "EXCEL_REPORT_DOWNLOADED"
+    elif format_choice.startswith("PDF"):
+        payload = _pdf_bytes_from_sheets(safe_sheets, clean_name)
+        mime = "application/pdf"; ext = "pdf"; action = "PDF_REPORT_DOWNLOADED"
+    else:
+        payload = _csv_bytes_from_sheets(safe_sheets)
+        mime = "text/csv"; ext = "csv"; action = "CSV_REPORT_DOWNLOADED"
+    if st.download_button(f"Download {name.replace('_', ' ').title()} {ext.upper()}", payload, f"{clean_name}.{ext}", mime, key=f"{key}_{ext}"):
+        log_audit(action, "Report", clean_name, f"Downloaded {clean_name}.{ext}", user().get("id"), user().get("role"))
+
+
 def csv_download(df: pd.DataFrame, name: str):
-    """Backwards-compatible name that now downloads Excel, never CSV."""
+    """Backwards-compatible helper now offering Excel, PDF and CSV."""
     if df is None or df.empty:
         return
-    safe = _redact_ui_df(df, name) if "_redact_ui_df" in globals() else df
-    payload = build_excel_workbook({"Detailed Records": safe}, name)
-    if st.download_button(
-        f"Download {name.replace('_', ' ').title()} Excel",
-        payload,
-        f"{name}.xlsx",
-        excel_mime(),
-        key=f"xlsx_download_{name}_{abs(hash(tuple(safe.columns))) % 10_000_000}",
-    ):
-        try:
-            log_audit("EXCEL_REPORT_DOWNLOADED", "Report", name, f"Downloaded {name}.xlsx", user().get("id"), user().get("role"))
-        except Exception:
-            pass
+    safe_key = f"download_{_normalise_report_name(name)}_{abs(hash(tuple(df.columns))) % 10_000_000}"
+    report_download_buttons({"Detailed Records": df}, name, safe_key)
 
 
 def _excel_download_button(label: str, filename: str, sheets: dict[str, pd.DataFrame], key: str):
-    payload = build_excel_workbook(sheets, filename)
-    clicked = st.download_button(label, payload, filename, excel_mime(), key=key)
-    if clicked:
-        log_audit("EXCEL_REPORT_DOWNLOADED", "Report", filename, label, user().get("id"), user().get("role"))
-    return clicked
+    """Backwards-compatible helper now offering Excel, PDF and CSV."""
+    base = filename.rsplit(".", 1)[0] if "." in filename else filename
+    title = label.replace("Download ", "").replace(" Excel", "").replace(" Workbook", "") or base
+    report_download_buttons(sheets, title, key)
+    return False
 
 
 def _status_values_for_queue(kind: str) -> tuple[str, ...]:
@@ -5973,7 +6082,7 @@ def _status_values_for_queue(kind: str) -> tuple[str, ...]:
         "approval": ("Submitted for Approval", "Pending Approver/MD Approval", "Pending Approval"),
         "finance": ("Approved", "Awaiting Payment", "Approved for Payment"),
         "receipt": ("Paid",),
-        "completed": ("Completed", "Closed", "Receipt Uploaded"),
+        "completed": ("Paid", "Receipt Uploaded", "Payment Submitted for Verification", "Completed", "Closed"),
     }.get(kind, tuple())
 
 
@@ -6422,8 +6531,55 @@ def procurement_dashboard():
         interactive_chart(_money_chart_df(spend), "Estimated Value by Category", "category", "total", "pm_category_value_cmd", default="Donut")
 
 
+def post_payment_closure_page():
+    st.subheader("Post-Payment Closure")
+    st.caption("Finance records payment and uploads receipt. Procurement Manager then completes, closes, and archives the record for history/audit.")
+    df = df_query("""
+        SELECT id, request_no, department_project, category, estimated_amount, status, payment_status, paid_at, updated_at
+        FROM purchase_requests
+        WHERE status IN ('Paid','Receipt Uploaded','Payment Submitted for Verification','Completed','Closed')
+           OR (next_role='procurement_manager' AND payment_status='Paid')
+        ORDER BY COALESCE(paid_at, updated_at, created_at) DESC
+        LIMIT 500
+    """)
+    if df.empty:
+        st.success("No paid records are waiting for completion, closure, or archive.")
+        return
+    show = df.copy()
+    show["estimated_amount"] = show["estimated_amount"].apply(money)
+    dataframe(show.drop(columns=["id"]))
+    selected = st.selectbox("Open paid record", [f"{r.request_no} — {r.status} — #{int(r.id)}" for r in df.itertuples()], key="pm_postpay_select_cmd")
+    pr_id = int(selected.rsplit("#", 1)[1])
+    pr = df[df["id"] == pr_id].iloc[0]
+    request_detail(pr_id, actions=False, key_scope=f"pm_postpay_{pr_id}")
+    note = st.text_area("Closure note", key=f"pm_postpay_note_{pr_id}")
+    c1, c2, c3 = st.columns(3)
+    if c1.button("Mark Completed", type="primary", disabled=pr["status"] not in ["Paid", "Receipt Uploaded", "Payment Submitted for Verification"], key=f"pm_mark_completed_{pr_id}"):
+        run_query("UPDATE purchase_requests SET status='Completed', next_role='procurement_manager', completed_at=COALESCE(completed_at, ?), updated_at=? WHERE id=?", (now_iso(), now_iso(), pr_id))
+        add_workflow_event("Purchase Request", pr_id, "Completed", "Completed", note or "Completed after payment by Procurement Manager", user()["id"])
+        log_audit("REQUEST_COMPLETED", "Purchase Request", pr_id, note or "Completed after payment", user()["id"], user()["role"], before_values={"status": pr["status"]}, after_values={"status": "Completed"})
+        owner_df = df_query("SELECT COALESCE(facility_manager_user_id, requested_by) owner_id FROM purchase_requests WHERE id=?", (pr_id,))
+        owner_id = int(owner_df.iloc[0,0] or 0) if not owner_df.empty else 0
+        if owner_id:
+            create_notification(owner_id, None, "Request completed", f"{pr['request_no']} has been marked Completed.", "Purchase Request", pr_id, "Normal", ["in_app"], action_label="Approved / Accepted Requests")
+        _notify_auditors("Request completed", f"{pr['request_no']} was completed by Procurement Manager.", "Purchase Request", pr_id)
+        _rerun_success("Record marked Completed.")
+    if c2.button("Close Record", disabled=pr["status"] != "Completed", key=f"pm_close_record_{pr_id}"):
+        run_query("UPDATE purchase_requests SET status='Closed', next_role='procurement_manager', updated_at=? WHERE id=?", (now_iso(), pr_id))
+        add_workflow_event("Purchase Request", pr_id, "Closed", "Closed", note or "Closed by Procurement Manager", user()["id"])
+        log_audit("REQUEST_CLOSED", "Purchase Request", pr_id, note or "Closed after completion", user()["id"], user()["role"], before_values={"status": pr["status"]}, after_values={"status": "Closed"})
+        _notify_auditors("Request closed", f"{pr['request_no']} was closed by Procurement Manager.", "Purchase Request", pr_id)
+        _rerun_success("Record closed.")
+    if c3.button("Archive Record", disabled=pr["status"] != "Closed", key=f"pm_archive_record_{pr_id}"):
+        run_query("UPDATE purchase_requests SET status='Archived', next_role='auditor', updated_at=? WHERE id=?", (now_iso(), pr_id))
+        add_workflow_event("Purchase Request", pr_id, "Archived", "Archived", note or "Archived by Procurement Manager", user()["id"])
+        log_audit("REQUEST_ARCHIVED", "Purchase Request", pr_id, note or "Archived after closure", user()["id"], user()["role"], before_values={"status": pr["status"]}, after_values={"status": "Archived"})
+        _notify_auditors("Request archived", f"{pr['request_no']} was archived by Procurement Manager.", "Purchase Request", pr_id)
+        _rerun_success("Record archived and visible in history/audit.")
+
+
 def procurement_workspace():
-    role_header("Procurement Manager Workspace", "Review Utility Head / Facility Head submissions, source vendors, and submit valid requests to Approver/Admin. This role cannot approve.")
+    role_header("Procurement Manager Workspace", "Review Utility Head / Facility Head submissions, source vendors, and submit valid requests to Approver/Admin. This role cannot approve normal procurement/payment requests.")
     section = st.session_state.get("procurement_section", "Operations Dashboard")
     if section == "Operations Dashboard":
         procurement_dashboard_metrics(); procurement_dashboard()
@@ -6447,6 +6603,8 @@ def procurement_workspace():
         vendors_page()
     elif section == "Gateway Pass Review":
         gateway_pass_review_queue("Gateway Pass Review")
+    elif section == "Post-Payment Closure":
+        post_payment_closure_page()
     elif section == "Availability / Away Notice":
         availability_panel()
     elif section == "Procurement Documents":
@@ -6465,6 +6623,36 @@ def procurement_workspace():
 
 def _gateway_department_options():
     return GATEWAY_DEPARTMENTS
+
+
+def _notify_auditors(title: str, message: str, entity_type: str, entity_id: int | None = None, importance: str = "Normal"):
+    try:
+        create_notification(None, "Auditor", title, message, entity_type, entity_id, importance, ["in_app"], action_label="Open Audit Dashboard")
+    except Exception:
+        pass
+
+
+def _row_to_dict(row) -> dict:
+    try:
+        return row.to_dict()
+    except Exception:
+        return dict(row)
+
+
+def _notify_gateway_event(row, title: str, message: str, target: str = "facility", importance: str = "High"):
+    """Route gateway notifications to the correct sidebar badge and auditor feed."""
+    data = _row_to_dict(row)
+    gp_id = int(data.get("id") or data.get("gateway_pass_id") or 0) or None
+    if target in ("facility", "all") and data.get("facility_manager_user_id"):
+        try:
+            create_notification(int(data["facility_manager_user_id"]), None, title, message, "Gateway Pass", gp_id, importance, ["in_app", "browser_push"], action_label="Open Gateway Pass")
+        except Exception:
+            pass
+    if target in ("reviewers", "all"):
+        create_notification(None, "Procurement Manager", title, message, "Gateway Pass", gp_id, importance, ["in_app", "browser_push"], action_label="Review Gateway Pass")
+        create_notification(None, "Approver", title, message, "Gateway Pass", gp_id, importance, ["in_app", "browser_push"], action_label="Review Gateway Pass")
+        create_notification(None, "Admin", title, message, "Gateway Pass", gp_id, "Important", ["in_app"], action_label="Gateway Pass Management")
+    _notify_auditors(title, message, "Gateway Pass", gp_id, "Normal")
 
 
 def create_gateway_pass_form():
@@ -6571,9 +6759,9 @@ def submit_gateway_pass(gateway_pass_id: int):
         st.error("Every item must include quantity > 0 and unit."); return
     run_query("UPDATE gateway_passes SET status='Sent for Procurement Review', next_role='procurement_manager', submitted_at=?, updated_at=? WHERE id=?", (now_iso(), now_iso(), gateway_pass_id))
     log_gateway_event(gateway_pass_id, "Sent for Procurement Review", "Sent for Procurement Review", "Submitted to Procurement Manager")
-    create_notification(None, "Procurement Manager", "Gateway pass sent for review", f"{row['pass_number']} requires procurement review.", "Gateway Pass", gateway_pass_id, "High", ["in_app", "browser_push"], action_label="Review Gateway Pass")
-    create_notification(int(row["facility_manager_user_id"]), None, "Gateway pass submitted", f"{row['pass_number']} was sent to Procurement Manager.", "Gateway Pass", gateway_pass_id, "Normal", ["in_app"])
-    _rerun_success("Gateway pass sent to Procurement Manager for review.")
+    _notify_gateway_event({**row.to_dict(), "id": gateway_pass_id}, "Gateway pass sent for review", f"{row['pass_number']} requires review by Procurement Manager and Approver/Admin.", target="reviewers", importance="High")
+    create_notification(int(row["facility_manager_user_id"]), None, "Gateway pass submitted", f"{row['pass_number']} was sent for review.", "Gateway Pass", gateway_pass_id, "Normal", ["in_app"], action_label="Open Gateway Pass")
+    _rerun_success("Gateway pass sent for review. Procurement Manager and Approver/Admin have been notified.")
 
 
 def _assert_gateway_reviewer(gateway_pass_id: int, acting_user: dict | None = None) -> bool:
@@ -6646,13 +6834,14 @@ def gateway_pass_review_queue(title: str, admin_mode: bool = False):
             if not note.strip(): st.error("Please enter a correction reason."); return
             run_query("UPDATE gateway_passes SET status='Returned for Correction', next_role=NULL, rejection_reason=?, updated_at=? WHERE id=?", (note, now_iso(), gp_id))
             log_gateway_event(gp_id, "Returned for Correction", "Returned for Correction", note)
-            create_notification(int(row["facility_manager_user_id"]), None, "Gateway pass returned", f"{row['pass_number']} was returned for correction. {note}", "Gateway Pass", gp_id, "High", ["in_app", "browser_push"])
+            _notify_gateway_event({**row.to_dict(), "id": gp_id}, "Gateway pass returned", f"{row['pass_number']} was returned for correction. {note}", target="facility", importance="High")
             _rerun_success("Gateway pass returned for correction.")
         if c4.button("Submit to Approver/Admin", key=f"gp_pm_submit_approver_{gp_id}"):
             run_query("UPDATE gateway_passes SET status='Submitted for Approval', next_role='approver', reviewed_by_user_id=?, reviewed_at=?, procurement_review_note=?, updated_at=? WHERE id=?", (user()["id"], now_iso(), note or "Submitted for approval", now_iso(), gp_id))
             log_gateway_event(gp_id, "Submitted for Approval", "Submitted for Approval", note)
-            create_notification(None, "Approver", "Gateway pass pending approval", f"{row['pass_number']} requires final approval.", "Gateway Pass", gp_id, "High", ["in_app", "browser_push"])
-            create_notification(None, "Admin", "Gateway pass pending approval", f"{row['pass_number']} requires final approval/oversight.", "Gateway Pass", gp_id, "Important", ["in_app"])
+            create_notification(None, "Approver", "Gateway pass pending approval", f"{row['pass_number']} requires final approval.", "Gateway Pass", gp_id, "High", ["in_app", "browser_push"], action_label="Review Gateway Pass")
+            create_notification(None, "Admin", "Gateway pass pending approval", f"{row['pass_number']} requires final approval/oversight.", "Gateway Pass", gp_id, "Important", ["in_app"], action_label="Gateway Pass Management")
+            _notify_auditors("Gateway pass submitted to Approver/Admin", f"{row['pass_number']} was submitted for final approval.", "Gateway Pass", gp_id)
             _rerun_success("Gateway pass submitted to Approver/Admin.")
     else:
         c1, c2, c3 = st.columns(3)
@@ -6877,9 +7066,9 @@ def facility_gateway_pass_page():
     if section == "Create Draft":
         create_gateway_pass_form()
     elif section == "Drafts / Returned":
-        gateway_pass_register("gp.facility_manager_user_id=? AND gp.status IN ('Draft','Returned for Correction')", (user()["id"],), "Drafts / Returned", allow_submit=True, key_prefix="facility_gp_drafts_cmd")
+        gateway_pass_register("gp.facility_manager_user_id=? AND gp.status IN ('Draft','Returned for Correction','Returned')", (user()["id"],), "Drafts / Returned", allow_submit=True, key_prefix="facility_gp_drafts_cmd")
     elif section == "Ready to Generate":
-        gateway_pass_register("gp.facility_manager_user_id=? AND gp.status='Approved'", (user()["id"],), "Approved Gateway Passes Ready to Generate", allow_generate=True, key_prefix="facility_gp_ready_cmd")
+        gateway_pass_register("gp.facility_manager_user_id=? AND gp.status IN ('Approved','Generated','Downloaded')", (user()["id"],), "Approved Gateway Passes Ready to Generate", allow_generate=True, key_prefix="facility_gp_ready_cmd")
     else:
         gateway_pass_register("gp.facility_manager_user_id=?", (user()["id"],), "Gateway Pass History", allow_generate=True, key_prefix="facility_gp_history_cmd")
 
@@ -6944,8 +7133,10 @@ def approved_for_payment_page():
             receipt_no = make_ref("RCT")
             rid = run_insert("INSERT INTO receipt_records (receipt_no, receipt_type, payment_method, payment_date, amount, purpose, linked_payment_id, status, file_path, notes, uploaded_by, created_at, updated_at) VALUES (?, 'Payment Receipt', ?, ?, ?, ?, ?, 'Recorded', ?, ?, ?, ?, ?)", (receipt_no, method, date.today().isoformat(), amount, row.get("Request number") or pno, pay_id, path, note, user()["id"], now_iso(), now_iso()))
             run_query("UPDATE payments SET receipt_id=? WHERE id=?", (rid, pay_id))
-            transition_request_status(entity_id, "Completed", "Completed", note or "Finance paid and uploaded receipt.", user()["id"], user()["role"], payment_status="Paid")
-            run_query("UPDATE purchase_requests SET next_role='auditor', paid_at=COALESCE(paid_at, ?), receipt_uploaded_at=?, completed_at=COALESCE(completed_at, ?) WHERE id=?", (now_iso(), now_iso(), now_iso(), entity_id))
+            transition_request_status(entity_id, "Paid", "Payment Completed", note or "Finance paid and uploaded receipt.", user()["id"], user()["role"], payment_status="Paid")
+            run_query("UPDATE purchase_requests SET next_role='procurement_manager', paid_at=COALESCE(paid_at, ?), receipt_uploaded_at=? WHERE id=?", (now_iso(), now_iso(), entity_id))
+            create_notification(None, "Procurement Manager", "Paid request ready for closure", f"{row.get('Request number') or 'A request'} has been paid. Please complete, close and archive it.", "Purchase Request", entity_id, "High", ["in_app", "browser_push"], action_label="Post-Payment Closure")
+            _notify_auditors("Payment completed", f"{row.get('Request number') or 'A request'} was paid by Finance and sent to Procurement Manager for closure.", "Purchase Request", entity_id)
         else:
             po = df_query("SELECT * FROM purchase_orders WHERE id=?", (entity_id,)).iloc[0]
             pay_id = run_insert("INSERT INTO payments (payment_no, po_id, vendor_id, amount, payment_method, payment_date, status, paid_by, notes, proof_path, created_by, created_at, updated_at, next_role) VALUES (?, ?, ?, ?, ?, ?, 'Paid', ?, ?, ?, ?, ?, ?, 'auditor')", (pno, entity_id, po.get("vendor_id"), amount, method, date.today().isoformat(), user()["id"], note, path, user()["id"], now_iso(), now_iso()))
@@ -6954,9 +7145,12 @@ def approved_for_payment_page():
             run_query("UPDATE payments SET receipt_id=? WHERE id=?", (rid, pay_id))
             run_query("UPDATE purchase_orders SET payment_status='Paid', status='Paid', updated_at=? WHERE id=?", (now_iso(), entity_id))
             if po.get("request_id"):
-                transition_request_status(int(po["request_id"]), "Completed", "Completed", note or "PO paid and receipt uploaded.", user()["id"], user()["role"], payment_status="Paid")
-        log_audit("PAYMENT_COMPLETED", entity_type, entity_id, {"payment_no": pno, "amount": amount, "receipt": path}, user()["id"], user()["role"], after_values={"status": "Completed"})
-        _rerun_success("Payment recorded, receipt uploaded, and item moved to Completed/History.")
+                transition_request_status(int(po["request_id"]), "Paid", "Payment Completed", note or "PO paid and receipt uploaded.", user()["id"], user()["role"], payment_status="Paid")
+                run_query("UPDATE purchase_requests SET next_role='procurement_manager', paid_at=COALESCE(paid_at, ?), receipt_uploaded_at=? WHERE id=?", (now_iso(), now_iso(), int(po["request_id"])))
+                create_notification(None, "Procurement Manager", "Paid request ready for closure", "A PO-linked request has been paid. Please complete, close and archive it.", "Purchase Request", int(po["request_id"]), "High", ["in_app", "browser_push"], action_label="Post-Payment Closure")
+                _notify_auditors("Payment completed", "A PO-linked request was paid by Finance and sent to Procurement Manager for closure.", "Purchase Request", int(po["request_id"]))
+        log_audit("PAYMENT_COMPLETED", entity_type, entity_id, {"payment_no": pno, "amount": amount, "receipt": path}, user()["id"], user()["role"], after_values={"status": "Paid", "next_role": "procurement_manager"})
+        _rerun_success("Payment recorded and receipt uploaded. Procurement Manager has been notified to complete, close and archive the record.")
     if c2.button("Add finance note only", key=f"finance_note_only_cmd_{entity_type}_{entity_id}"):
         if entity_type == "Purchase Request":
             run_query("UPDATE purchase_requests SET finance_note=?, updated_at=? WHERE id=?", (note, now_iso(), entity_id))
@@ -7299,6 +7493,10 @@ def procurement_reports():
 
 def audit_dashboard():
     st.subheader("Compliance Snapshot")
+    recent_notifs = df_query("SELECT title, message, entity_type, entity_id, created_at FROM notifications WHERE role='Auditor' OR user_id=? ORDER BY created_at DESC LIMIT 25", (user()["id"],))
+    if not recent_notifs.empty:
+        st.markdown("#### Recent activity notifications")
+        dataframe(recent_notifs)
     metric_row([
         ("Total Submitted", int(df_query("SELECT COUNT(*) FROM purchase_requests WHERE status NOT IN ('Draft','FM Draft')").iloc[0,0]), "cumulative"),
         ("Total Approved", int(df_query("SELECT COUNT(*) FROM purchase_requests WHERE status IN ('Approved','Awaiting Payment','Paid','Completed','Closed')").iloc[0,0]), "cumulative"),
