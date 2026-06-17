@@ -1,0 +1,11 @@
+streamlit>=1.32
+pandas>=2.0
+openpyxl>=3.1
+pillow>=10.0
+pytesseract>=0.3.10
+pymupdf>=1.23
+python-docx>=1.1.0
+reportlab>=4.0
+plotly>=5.20
+python-dotenv>=1.0
+pytest>=8.0

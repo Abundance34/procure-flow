@@ -1,0 +1,26 @@
+Windows installation note
+=========================
+
+If pip shows an error like:
+
+OSError: [Errno 2] No such file or directory ... streamlit ... dashboard-seattle-weather ... streamlit_app.py
+HINT: This error might have occurred since this system does not have Windows Long Path support enabled.
+
+This is usually not an app bug. It happens because the project was extracted into a very long folder path, and Streamlit contains some long internal file names.
+
+Fastest fix:
+1. Extract this ZIP directly to C:\pf or another short folder.
+2. Open Command Prompt inside C:\pf\pf.
+3. Run INSTALL_WINDOWS.bat.
+4. Run RUN_APP.bat.
+
+Manual commands:
+cd C:\pf\pf
+python -m venv .v
+.v\Scripts\activate
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+streamlit run app.py
+
+Optional permanent Windows fix:
+Enable Win32 long paths in Windows settings/group policy/registry, then restart the computer. This allows paths longer than 260 characters.
