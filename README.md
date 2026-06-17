@@ -363,3 +363,15 @@ Extract the project to a short path such as `C:\ProcureFlow` and avoid deeply ne
 - Procurement Manager now has a `Post-Payment Closure` section to mark paid records as `Completed`, then `Closed`, then `Archived`.
 - Auditor dashboard now includes recent activity notifications in addition to the audit log and report views.
 - Downloads now support three formats across report/download surfaces: Excel `.xlsx`, PDF `.pdf`, and CSV `.csv`. The selected format is generated only on demand to keep tab navigation fast.
+
+## Focused Gateway Pass Approval and Notification Fix
+
+This build corrects the Gateway Pass approval handoff and notification routing:
+
+- Gateway Pass approval now follows the strict chain: Utility Head / Facility Head → Procurement Manager review → Approver / MD or Admin final approval → Utility Head / Facility Head ready-to-generate queue.
+- Procurement Manager no longer has a Gateway Pass approval button or approval permission. Procurement Manager can review, return for correction, or submit Gateway Passes to Approver / MD.
+- Approver / MD receives Gateway Pass notifications only after Procurement Manager submits the pass for final approval.
+- When Approver / MD or Admin approves, the record is set to `Approved` and `next_role='facility_manager'`, which activates the Utility Head / Facility Head Ready to Generate tab.
+- The Gateway Pass Ready to Generate queue shows only approved, not-yet-generated passes; after generation, the pass moves to History and remains downloadable.
+- Notification badge logic was aligned with the updated routing so Procurement Manager, Approver / MD, Utility Head / Facility Head, Admin, and Auditor receive the correct workflow notices.
+- The generated Gateway Pass PDF keeps the uploaded CMOTD/RSU-style template layout with logos, title, reference/date, property details, transport details, authorization, and security verification lines.

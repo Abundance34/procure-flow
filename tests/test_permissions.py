@@ -14,13 +14,15 @@ def test_finance_cannot_create_payment_requests():
     assert can_create_payment_request("Approver")
 
 
-def test_procurement_manager_has_gateway_only_approval_permission():
+def test_procurement_manager_reviews_gateway_but_cannot_approve():
     perms = safe_role_permissions("Procurement Manager")
     assert "approve_request" not in perms
     assert "approve_payment" not in perms
-    assert "approve_gateway_pass" in perms
+    assert "approve_gateway_pass" not in perms
+    assert "review_gateway_pass" in perms
+    assert "submit_for_approval" in perms
     assert not can_approve("Procurement Manager")
-    assert can_approve_gateway_pass("Procurement Manager")
+    assert not can_approve_gateway_pass("Procurement Manager")
 
 
 def test_utility_visible_label():

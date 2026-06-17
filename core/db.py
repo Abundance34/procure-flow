@@ -1390,7 +1390,7 @@ def seed_phase2_defaults():
         run_query("INSERT OR IGNORE INTO permissions (name, description, created_at) VALUES (?, ?, ?)", (p, p.replace('_', ' ').title(), now_iso()))
     role_map = {
         "Admin": new_permissions,
-        "Procurement Manager": ["manage_notification_preferences", "browser_push_setup", "mark_away", "review_gateway_pass", "approve_gateway_pass"],
+        "Procurement Manager": ["manage_notification_preferences", "browser_push_setup", "mark_away", "review_gateway_pass"],
         "Facility Manager": ["manage_notification_preferences", "browser_push_setup", "create_gateway_pass", "edit_own_gateway_pass", "submit_gateway_pass", "generate_gateway_pass", "download_gateway_pass"],
         "Finance": ["manage_notification_preferences", "browser_push_setup"],
         "Approver": ["manage_notification_preferences", "browser_push_setup", "mark_away", "review_gateway_pass", "approve_gateway_pass"],
@@ -1602,10 +1602,11 @@ def notify_gateway_pass_reviewers(gateway_pass_id: int, title: str = "Gateway Pa
     if not gp:
         return
     gp = gp[0]
-    msg = message or f"Gateway pass {gp['pass_number']} requires review."
+    msg = message or f"Gateway pass {gp['pass_number']} requires Procurement Manager review before final approval."
+    # Utility Head / Facility Head submissions route first to Procurement Manager.
+    # Approver / MD is notified only after Procurement Manager submits for final approval.
     create_notification(None, "Procurement Manager", title, msg, "Gateway Pass", gateway_pass_id, "High", ["in_app", "browser_push"], action_label="Review Gateway Pass")
-    create_notification(None, "Approver", title, msg, "Gateway Pass", gateway_pass_id, "High", ["in_app", "browser_push"], action_label="Review Gateway Pass")
-    create_notification(None, "Admin", "Gateway Pass Oversight", msg, "Gateway Pass", gateway_pass_id, "Normal", ["in_app"])
+    create_notification(None, "Admin", "Gateway Pass Oversight", msg, "Gateway Pass", gateway_pass_id, "Normal", ["in_app"], action_label="Gateway Pass Management")
 
 def seed_defaults():
     hash_password = _seed_hash_password
@@ -2338,8 +2339,9 @@ def ensure_command_chain_schema():
         run_query("UPDATE purchase_requests SET next_role='approver' WHERE status IN ('Pending Approval','Pending Approver/MD Approval','Submitted for Approval') AND (next_role IS NULL OR next_role='')")
         run_query("UPDATE purchase_requests SET next_role='finance', payment_status=COALESCE(NULLIF(payment_status,''),'Approved for Payment') WHERE status IN ('Approved','Approved for Payment','Awaiting Payment') AND (next_role IS NULL OR next_role='')")
         run_query("UPDATE purchase_requests SET next_role='auditor' WHERE status IN ('Paid','Completed','Closed') AND (next_role IS NULL OR next_role='')")
-        run_query("UPDATE gateway_passes SET next_role='procurement_manager' WHERE status IN ('Submitted','Pending Procurement Manager / Approver Review','Sent for Procurement Review') AND (next_role IS NULL OR next_role='')")
-        run_query("UPDATE gateway_passes SET next_role='approver' WHERE status IN ('Submitted for Approval') AND (next_role IS NULL OR next_role='')")
+        run_query("UPDATE gateway_passes SET next_role='procurement_manager' WHERE status IN ('Submitted','Pending Procurement Manager / Approver Review','Sent for Procurement Review','Reviewed by Procurement') AND (next_role IS NULL OR next_role='')")
+        run_query("UPDATE gateway_passes SET next_role='approver' WHERE status IN ('Submitted for Approval','Pending Approval') AND (next_role IS NULL OR next_role='')")
+        run_query("UPDATE gateway_passes SET next_role='facility_manager' WHERE status='Approved' AND (next_role IS NULL OR next_role='')")
     except Exception:
         pass
 

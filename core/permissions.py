@@ -27,9 +27,10 @@ def can_approve(role: str | None) -> bool:
 
 
 def can_approve_gateway_pass(role: str | None) -> bool:
-    # Gateway Pass has a deliberate business-rule exception: Procurement Manager
-    # may approve gateway passes only, not purchases, payments, POs, or finance items.
-    return role in APPROVAL_ROLES | {"Procurement Manager"}
+    # Gateway pass final approval follows the same final-authority rule as
+    # normal approvals: only Admin and Approver / MD can approve.
+    # Procurement Manager reviews and submits gateway passes to Approver / MD.
+    return role in APPROVAL_ROLES
 
 
 def can_reject(role: str | None) -> bool:
@@ -95,7 +96,7 @@ def safe_role_permissions(role: str | None) -> set[str]:
             "create_request", "edit_request", "edit_own_request", "submit_request", "procurement_review",
             "create_sourcing", "manage_quotes", "recommend_vendor", "create_po", "receive_goods",
             "manage_vendor", "import_documents", "view_reports", "return_for_clarification",
-            "communicate_with_procurement_manager", "review_gateway_pass", "approve_gateway_pass", "submit_for_approval",
+            "communicate_with_procurement_manager", "review_gateway_pass", "submit_for_approval",
         }
     if role == "Facility Manager":
         return base | {

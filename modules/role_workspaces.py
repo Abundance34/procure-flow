@@ -6761,9 +6761,10 @@ def submit_gateway_pass(gateway_pass_id: int):
         st.error("Every item must include quantity > 0 and unit."); return
     run_query("UPDATE gateway_passes SET status='Sent for Procurement Review', next_role='procurement_manager', submitted_at=?, updated_at=? WHERE id=?", (now_iso(), now_iso(), gateway_pass_id))
     log_gateway_event(gateway_pass_id, "Sent for Procurement Review", "Sent for Procurement Review", "Submitted to Procurement Manager")
-    _notify_gateway_event({**row.to_dict(), "id": gateway_pass_id}, "Gateway pass sent for review", f"{row['pass_number']} requires review by Procurement Manager and Approver/Admin.", target="reviewers", importance="High")
-    create_notification(int(row["facility_manager_user_id"]), None, "Gateway pass submitted", f"{row['pass_number']} was sent for review.", "Gateway Pass", gateway_pass_id, "Normal", ["in_app"], action_label="Open Gateway Pass")
-    _rerun_success("Gateway pass sent for review. Procurement Manager and Approver/Admin have been notified.")
+    create_notification(None, "Procurement Manager", "Gateway pass sent for review", f"{row['pass_number']} requires Procurement Manager review before final approval.", "Gateway Pass", gateway_pass_id, "High", ["in_app", "browser_push"], action_label="Review Gateway Pass")
+    create_notification(int(row["facility_manager_user_id"]), None, "Gateway pass submitted to Procurement Manager", f"{row['pass_number']} was sent to Procurement Manager for review.", "Gateway Pass", gateway_pass_id, "Normal", ["in_app"], action_label="Open Gateway Pass")
+    _notify_auditors("Gateway pass sent for review", f"{row['pass_number']} was sent to Procurement Manager for review.", "Gateway Pass", gateway_pass_id)
+    _rerun_success("Gateway pass sent to Procurement Manager for review. Procurement Manager has been notified.")
 
 
 def _assert_gateway_reviewer(gateway_pass_id: int, acting_user: dict | None = None) -> bool:
@@ -6777,37 +6778,40 @@ def _assert_gateway_reviewer(gateway_pass_id: int, acting_user: dict | None = No
 
 def _gateway_approve(gateway_pass_id: int, decision: str, note: str):
     role = _current_role()
-    # Gateway Pass is the only workflow where Procurement Manager may approve.
-    # Normal purchase/payment approvals still use can_approve() and remain Admin/Approver only.
-    if role not in ["Admin", "Approver", "Procurement Manager"]:
-        st.error("Only Admin, Approver / MD, or Procurement Manager can approve or reject gateway passes.")
+    if role == "Procurement Manager":
+        st.error("Procurement Manager can review and submit gateway passes to Approver / MD, but cannot approve them.")
+        return
+    if not can_approve(role):
+        st.error("Only Admin and Approver / MD can approve, return, or reject gateway passes.")
         return
     row_df = df_query("SELECT * FROM gateway_passes WHERE id=?", (gateway_pass_id,))
     if row_df.empty:
         st.error("Gateway pass not found."); return
     row = row_df.iloc[0]
-    if row["status"] not in ["Sent for Procurement Review", "Reviewed by Procurement", "Submitted", "Submitted for Approval", "Pending Approval", "Pending Procurement Manager / Approver Review"]:
-        st.warning("Only submitted gateway passes can be approved, returned or rejected."); return
+    allowed_statuses = ["Submitted for Approval", "Pending Approval"]
+    if role == "Admin":
+        # Admin keeps audited override ability without making Procurement Manager an approver.
+        allowed_statuses += ["Sent for Procurement Review", "Reviewed by Procurement", "Submitted", "Pending Procurement Manager / Approver Review"]
+    if row["status"] not in allowed_statuses and row.get("next_role") != "approver":
+        st.warning("Gateway passes must be submitted by Procurement Manager to Approver / MD before final approval."); return
     if decision in ["Rejected", "Returned for Correction"] and not note.strip():
         st.error("A rejection or return reason is required."); return
     if decision == "Approved":
-        # Approval must hand the record back to Utility Head / Facility Head for
-        # final generation. Keeping next_role explicit fixes the missing
-        # "Ready to Generate" route after Procurement Manager approval.
+        # Final approval hands the record back to Utility Head / Facility Head for preview/generation.
         run_query("UPDATE gateway_passes SET status='Approved', next_role='facility_manager', approved_at=?, approved_by_user_id=?, approved_by_role=?, approval_note=?, updated_at=? WHERE id=?", (now_iso(), user()["id"], role, note or "Approved.", now_iso(), gateway_pass_id))
-        decision_label = "Approved"; title = "Gateway Pass Approved - Ready to Generate"; msg = f"{row['pass_number']} has been approved by {display_role(role)}. It is now ready to preview, generate and download."
+        decision_label = "Approved"; title = "Gateway Pass Approved - Ready to Generate"; msg = f"{row['pass_number']} has been approved by {display_role(role)}. Open Gateway Pass > Ready to Generate to preview and download it."
     elif decision == "Rejected":
         run_query("UPDATE gateway_passes SET status='Rejected', next_role=NULL, rejected_at=?, rejected_by_user_id=?, rejection_reason=?, updated_at=? WHERE id=?", (now_iso(), user()["id"], note, now_iso(), gateway_pass_id))
         decision_label = "Rejected"; title = "Gateway Pass Rejected"; msg = f"{row['pass_number']} was rejected. Reason: {note}"
     else:
-        # Returned records must appear in the Facility Head Drafts / Returned
-        # tab for correction and resubmission.
         run_query("UPDATE gateway_passes SET status='Returned for Correction', next_role='facility_manager', rejection_reason=?, updated_at=? WHERE id=?", (note, now_iso(), gateway_pass_id))
         decision_label = "Returned for Correction"; title = "Gateway Pass Returned"; msg = f"{row['pass_number']} was returned for correction. Reason: {note}"
     run_query("INSERT INTO gateway_pass_approvals (gateway_pass_id, approver_user_id, approver_role, decision, note, created_at) VALUES (?, ?, ?, ?, ?, ?)", (gateway_pass_id, user()["id"], role, decision_label, note, now_iso()))
     log_gateway_event(gateway_pass_id, f"Gateway Pass {decision_label}", decision_label, note)
     action_label = "Ready to Generate" if decision_label == "Approved" else "Open Gateway Pass"
     create_notification(int(row["facility_manager_user_id"]), None, title, msg, "Gateway Pass", gateway_pass_id, "High", ["in_app", "browser_push"], action_label=action_label)
+    if decision_label == "Approved":
+        create_notification(None, "Procurement Manager", "Gateway pass final approval completed", f"{row['pass_number']} was approved by {display_role(role)} and routed to Utility Head / Facility Head for generation.", "Gateway Pass", gateway_pass_id, "Normal", ["in_app"], action_label="Review Gateway Pass")
     _notify_auditors(title, msg, "Gateway Pass", gateway_pass_id)
     _rerun_success(f"Gateway pass {decision_label.lower()}.")
 
@@ -6817,9 +6821,9 @@ def gateway_pass_review_queue(title: str, admin_mode: bool = False):
     st.subheader(title)
     role = _current_role()
     if role == "Procurement Manager" and not admin_mode:
-        df = gateway_pass_summary_df("gp.status IN ('Sent for Procurement Review','Submitted','Pending Procurement Manager / Approver Review') OR gp.next_role='procurement_manager'", ())
+        df = gateway_pass_summary_df("(gp.status IN ('Sent for Procurement Review','Submitted','Pending Procurement Manager / Approver Review') OR gp.next_role='procurement_manager')", ())
     elif can_approve(role) or admin_mode:
-        df = gateway_pass_summary_df("gp.status IN ('Submitted for Approval','Pending Approval','Sent for Procurement Review') OR gp.next_role='approver'", ())
+        df = gateway_pass_summary_df("(gp.status IN ('Submitted for Approval','Pending Approval') OR gp.next_role='approver')", ())
     else:
         st.info("This queue is not available to your role."); return
     if df.empty:
@@ -6832,26 +6836,27 @@ def gateway_pass_review_queue(title: str, admin_mode: bool = False):
     gateway_pass_detail(gp_id)
     note = st.text_area("Review note / reason", key=f"gp_review_note_cmd_{gp_id}_{role}_{admin_mode}")
     if role == "Procurement Manager":
-        c1, c2, c3, c4 = st.columns(4)
-        if c1.button("Approve Gateway Pass", type="primary", key=f"gp_pm_approve_{gp_id}"):
-            _gateway_approve(gp_id, "Approved", note or "Approved by Procurement Manager.")
-        if c2.button("Mark Reviewed", key=f"gp_pm_reviewed_{gp_id}"):
+        st.info("Procurement Manager reviews gateway passes and submits valid ones to Approver / MD. There is no Procurement Manager approval button.")
+        c1, c2, c3 = st.columns(3)
+        if c1.button("Mark Reviewed", key=f"gp_pm_reviewed_{gp_id}"):
             run_query("UPDATE gateway_passes SET status='Reviewed by Procurement', next_role='procurement_manager', reviewed_by_user_id=?, reviewed_at=?, procurement_review_note=?, updated_at=? WHERE id=?", (user()["id"], now_iso(), note or "Reviewed by Procurement Manager", now_iso(), gp_id))
             log_gateway_event(gp_id, "Reviewed by Procurement", "Reviewed by Procurement", note)
+            _notify_auditors("Gateway pass reviewed by Procurement Manager", f"{row['pass_number']} was reviewed by Procurement Manager.", "Gateway Pass", gp_id)
             _rerun_success("Gateway pass marked reviewed by Procurement Manager.")
-        if c3.button("Return for Correction", key=f"gp_pm_return_{gp_id}"):
+        if c2.button("Return for Correction", key=f"gp_pm_return_{gp_id}"):
             if not note.strip(): st.error("Please enter a correction reason."); return
             run_query("UPDATE gateway_passes SET status='Returned for Correction', next_role='facility_manager', rejection_reason=?, updated_at=? WHERE id=?", (note, now_iso(), gp_id))
             log_gateway_event(gp_id, "Returned for Correction", "Returned for Correction", note)
             _notify_gateway_event({**row.to_dict(), "id": gp_id}, "Gateway pass returned", f"{row['pass_number']} was returned for correction. {note}", target="facility", importance="High")
             _rerun_success("Gateway pass returned for correction.")
-        if c4.button("Submit to Approver/Admin", key=f"gp_pm_submit_approver_{gp_id}"):
-            run_query("UPDATE gateway_passes SET status='Submitted for Approval', next_role='approver', reviewed_by_user_id=?, reviewed_at=?, procurement_review_note=?, updated_at=? WHERE id=?", (user()["id"], now_iso(), note or "Submitted for approval", now_iso(), gp_id))
+        if c3.button("Submit to Approver / MD", type="primary", key=f"gp_pm_submit_approver_{gp_id}"):
+            run_query("UPDATE gateway_passes SET status='Submitted for Approval', next_role='approver', reviewed_by_user_id=?, reviewed_at=?, procurement_review_note=?, updated_at=? WHERE id=?", (user()["id"], now_iso(), note or "Submitted for final approval", now_iso(), gp_id))
             log_gateway_event(gp_id, "Submitted for Approval", "Submitted for Approval", note)
-            create_notification(None, "Approver", "Gateway pass pending approval", f"{row['pass_number']} requires final approval.", "Gateway Pass", gp_id, "High", ["in_app", "browser_push"], action_label="Review Gateway Pass")
-            create_notification(None, "Admin", "Gateway pass pending approval", f"{row['pass_number']} requires final approval/oversight.", "Gateway Pass", gp_id, "Important", ["in_app"], action_label="Gateway Pass Management")
-            _notify_auditors("Gateway pass submitted to Approver/Admin", f"{row['pass_number']} was submitted for final approval.", "Gateway Pass", gp_id)
-            _rerun_success("Gateway pass submitted to Approver/Admin.")
+            create_notification(None, "Approver", "Gateway pass pending final approval", f"{row['pass_number']} requires final approval from Approver / MD.", "Gateway Pass", gp_id, "High", ["in_app", "browser_push"], action_label="Review Gateway Pass")
+            create_notification(None, "Admin", "Gateway pass pending final approval", f"{row['pass_number']} requires final approval/oversight.", "Gateway Pass", gp_id, "Important", ["in_app"], action_label="Gateway Pass Management")
+            create_notification(int(row["facility_manager_user_id"]), None, "Gateway pass submitted for final approval", f"{row['pass_number']} was reviewed by Procurement Manager and sent to Approver / MD.", "Gateway Pass", gp_id, "Normal", ["in_app"], action_label="Open Gateway Pass")
+            _notify_auditors("Gateway pass submitted to Approver / MD", f"{row['pass_number']} was submitted for final approval.", "Gateway Pass", gp_id)
+            _rerun_success("Gateway pass submitted to Approver / MD.")
     else:
         c1, c2, c3 = st.columns(3)
         if c1.button("Approve Gateway Pass", type="primary", key=f"gp_approve_cmd_{gp_id}_{role}"):
@@ -6938,84 +6943,149 @@ def generate_gateway_pass_document(gateway_pass_id: int) -> str | None:
         st.error("Gateway pass not found."); return None
     row = gp.iloc[0]
     if row["status"] not in ["Approved", "Generated", "Downloaded", "Completed"]:
-        st.error("Generate is disabled until the gateway pass is approved by Procurement Manager, Admin, or Approver / MD."); return None
+        st.error("Generate is disabled until the gateway pass is approved by Admin or Approver / MD."); return None
     items = gateway_pass_items_df(gateway_pass_id)
     if items.empty:
         st.error("Cannot generate a gateway pass without item lines."); return None
+
+    def _ptext(value: Any, default: str = "") -> str:
+        return escape(_clean(value, default)).replace("\n", "<br/>")
+
+    def _first_item_text(key: str, default: str = "") -> str:
+        if items.empty:
+            return default
+        return _clean(items.iloc[0].get(key), default)
+
     try:
         from reportlab.lib import colors
         from reportlab.lib.pagesizes import A4
         from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
         from reportlab.lib.units import mm
-        from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+        from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, Image, KeepTogether
+
         out_dir = Path("data/attachments/gateway_passes")
         out_dir.mkdir(parents=True, exist_ok=True)
         path = out_dir / f"{str(row['pass_number']).replace('/', '_')}.pdf"
-        doc = SimpleDocTemplate(str(path), pagesize=A4, rightMargin=14*mm, leftMargin=14*mm, topMargin=12*mm, bottomMargin=12*mm)
+        doc = SimpleDocTemplate(str(path), pagesize=A4, rightMargin=16*mm, leftMargin=16*mm, topMargin=12*mm, bottomMargin=12*mm)
         styles = getSampleStyleSheet()
-        normal = ParagraphStyle("gp_normal_cmd", parent=styles["Normal"], fontSize=8.5, leading=11)
-        title = ParagraphStyle("gp_title_cmd", parent=styles["Title"], fontSize=15, alignment=1, textColor=colors.HexColor("#0f172a"), spaceAfter=3)
-        small = ParagraphStyle("gp_small_cmd", parent=normal, fontSize=7.2, leading=9)
-        h = ParagraphStyle("gp_heading_cmd", parent=styles["Heading3"], fontSize=9.5, leading=11, spaceBefore=5, spaceAfter=3)
+        normal = ParagraphStyle("gp_normal_template", parent=styles["Normal"], fontName="Helvetica", fontSize=9.2, leading=13, spaceAfter=4)
+        body = ParagraphStyle("gp_body_template", parent=normal, fontSize=10.2, leading=15)
+        title_style = ParagraphStyle("gp_title_template", parent=styles["Title"], fontName="Helvetica-Bold", fontSize=14.5, leading=17, alignment=1, textColor=colors.black, spaceAfter=1)
+        sub_style = ParagraphStyle("gp_sub_template", parent=title_style, fontSize=13, leading=15)
+        motto_style = ParagraphStyle("gp_motto_template", parent=normal, fontName="Helvetica-BoldOblique", fontSize=8.8, leading=11, alignment=1)
+        section_style = ParagraphStyle("gp_section_template", parent=styles["Heading3"], fontName="Helvetica-Bold", fontSize=10.8, leading=13, spaceBefore=8, spaceAfter=5, textColor=colors.black)
+        small = ParagraphStyle("gp_small_template", parent=normal, fontSize=7.8, leading=9.5)
+        cell = ParagraphStyle("gp_cell_template", parent=normal, fontSize=7.2, leading=8.6)
+
         story = []
-        story.append(Paragraph("Consultancy Services Unit, Rivers State University", title))
-        story.append(Paragraph("Center For Marine and Offshore Technology Development (CMOTD)", ParagraphStyle("sub_cmd", parent=normal, alignment=1, fontSize=9)))
-        story.append(Paragraph("PROPERTY MOVEMENT GATE PASS", ParagraphStyle("doc_cmd", parent=styles["Heading1"], alignment=1, fontSize=13, textColor=colors.HexColor("#111827"))))
-        info = [
-            ["Reference No.", row.get("pass_number") or "", "Date", date.today().strftime("%d %B %Y")],
-            ["Department", row.get("department") or "", "Movement Type", row.get("movement_type") or ""],
-            ["Origin", row.get("origin_location") or "", "Destination", row.get("destination") or ""],
-            ["Movement Date", _fmt_clean_date(row.get("expected_movement_date")), "Return Date", _fmt_clean_date(row.get("expected_return_date"))],
-            ["Utility Head / Facility Head", row.get("facility_manager") or "", "Security Checkpoint", row.get("security_checkpoint") or ""],
+        cmotd_path = _gateway_asset_path("cmotd_logo.png")
+        rsu_path = _gateway_asset_path("rsu_logo.png")
+        left_logo = Image(str(cmotd_path), width=22*mm, height=20*mm) if cmotd_path.exists() else Paragraph("CMOTD", normal)
+        right_logo = Image(str(rsu_path), width=21*mm, height=20*mm) if rsu_path.exists() else Paragraph("RSU", normal)
+        header_mid = [
+            Paragraph("Center For Marine and Offshore Technology Development (CMOTD)", title_style),
+            Paragraph("Consultancy Services Unit, Rivers State University", sub_style),
+            Paragraph("Where Theory becomes Reality and Individuals are Equipped to Lead in the Industry!", motto_style),
         ]
-        info_table = Table(info, colWidths=[35*mm, 57*mm, 35*mm, 57*mm])
-        info_table.setStyle(TableStyle([
-            ("GRID", (0,0), (-1,-1), .35, colors.grey), ("BACKGROUND", (0,0), (0,-1), colors.HexColor("#f1f5f9")),
-            ("BACKGROUND", (2,0), (2,-1), colors.HexColor("#f1f5f9")), ("FONTNAME", (0,0), (-1,-1), "Helvetica"),
-            ("FONTSIZE", (0,0), (-1,-1), 8), ("VALIGN", (0,0), (-1,-1), "MIDDLE"), ("PADDING", (0,0), (-1,-1), 4),
-        ]))
-        story.append(info_table)
-        story.append(Spacer(1, 6)); story.append(Paragraph("ITEM DETAILS", h))
-        data = [["No.", "Item Description", "Colour", "Qty", "Unit", "Condition", "Fragility", "Serial/Asset", "Handling"]]
-        for idx, it in enumerate(items.itertuples(), 1):
-            data.append([idx, Paragraph(str(it.item_description), small), getattr(it, "colour", "") or "", it.quantity, it.unit_of_measure, it.quality_condition, it.fragility_status, f"{it.serial_number or ''} {it.asset_tag or ''}", Paragraph(it.handling_instruction or "", small)])
-        table = Table(data, colWidths=[7*mm, 43*mm, 17*mm, 12*mm, 15*mm, 22*mm, 18*mm, 26*mm, 24*mm], repeatRows=1)
-        table.setStyle(TableStyle([
-            ("GRID", (0,0), (-1,-1), .3, colors.grey), ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#dbeafe")),
-            ("FONTSIZE", (0,0), (-1,-1), 7), ("VALIGN", (0,0), (-1,-1), "TOP"), ("PADDING", (0,0), (-1,-1), 3),
-        ]))
-        story.append(table)
-        story.append(Spacer(1, 6)); story.append(Paragraph("PURPOSE", h)); story.append(Paragraph(row.get("purpose") or "", normal))
-        story.append(Spacer(1, 6)); story.append(Paragraph("TRANSPORT DETAILS", h))
-        story.append(Table([
-            ["Vehicle Number", row.get("vehicle_number") or "", "Driver Name", row.get("driver_name") or ""],
-            ["Driver Phone", row.get("driver_phone") or "", "Receiver", row.get("receiver_name") or ""],
-        ], colWidths=[35*mm, 57*mm, 35*mm, 57*mm], style=TableStyle([("GRID", (0,0), (-1,-1), .3, colors.grey), ("BACKGROUND", (0,0), (0,-1), colors.HexColor("#f8fafc")), ("BACKGROUND", (2,0), (2,-1), colors.HexColor("#f8fafc")), ("FONTSIZE", (0,0), (-1,-1), 8), ("PADDING", (0,0), (-1,-1), 4)])))
-        blank = ""
-        form_style = TableStyle([
-            ("BOX", (0,0), (-1,-1), .25, colors.lightgrey),
-            ("INNERGRID", (0,0), (-1,-1), .15, colors.lightgrey),
-            ("FONTNAME", (0,0), (0,-1), "Helvetica-Bold"),
-            ("FONTNAME", (2,0), (2,-1), "Helvetica-Bold"),
-            ("FONTSIZE", (0,0), (-1,-1), 8),
+        header = Table([[left_logo, header_mid, right_logo]], colWidths=[25*mm, 128*mm, 25*mm])
+        header.setStyle(TableStyle([
             ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
-            ("PADDING", (0,0), (-1,-1), 5),
+            ("ALIGN", (0,0), (0,0), "LEFT"),
+            ("ALIGN", (2,0), (2,0), "RIGHT"),
+            ("BOTTOMPADDING", (0,0), (-1,-1), 2),
+        ]))
+        story.append(header)
+        story.append(Spacer(1, 7))
+        story.append(Paragraph("PROPERTY MOVEMENT GATE PASS", section_style))
+
+        ref_table = Table([
+            [Paragraph("<b>Reference No.:</b>", normal), Paragraph(_ptext(row.get("pass_number")), normal)],
+            [Paragraph("<b>Date:</b>", normal), Paragraph(_fmt_clean_date(row.get("approved_at")) or date.today().strftime("%d %B %Y"), normal)],
+            [Paragraph("<b>Department:</b>", normal), Paragraph(_ptext(row.get("department")), normal)],
+            [Paragraph("<b>Movement Type:</b>", normal), Paragraph(_ptext(row.get("movement_type")), normal)],
+            [Paragraph("<b>Movement Date:</b>", normal), Paragraph(_fmt_clean_date(row.get("expected_movement_date")), normal)],
+            [Paragraph("<b>Origin:</b>", normal), Paragraph(_ptext(row.get("origin_location"), "N/A"), normal)],
+            [Paragraph("<b>Destination:</b>", normal), Paragraph(_ptext(row.get("destination"), "N/A"), normal)],
+        ], colWidths=[33*mm, 145*mm])
+        ref_table.setStyle(TableStyle([
+            ("VALIGN", (0,0), (-1,-1), "TOP"),
+            ("LEFTPADDING", (0,0), (-1,-1), 0),
+            ("RIGHTPADDING", (0,0), (-1,-1), 3),
+            ("BOTTOMPADDING", (0,0), (-1,-1), 4),
+        ]))
+        story.append(ref_table)
+        story.append(Spacer(1, 4))
+        story.append(Paragraph("This Gate Pass serves as official authorization for the movement of the underlisted company asset(s) from the premises of the Centre for Marine and Offshore Technology Development (CMOTD).", body))
+
+        story.append(Paragraph("PROPERTY DETAILS", section_style))
+        if len(items) == 1:
+            item_text = _first_item_text("item_description", "listed company asset")
+            quantity_text = f"{_qty_text(_first_item_text('quantity', '0'))} {_first_item_text('unit_of_measure', '')}".strip()
+            prop_rows = [
+                [Paragraph("Item Description:", normal), Paragraph(_ptext(item_text), normal)],
+                [Paragraph("Colour:", normal), Paragraph(_ptext(_first_item_text("colour", "N/A")), normal)],
+                [Paragraph("Quantity:", normal), Paragraph(_ptext(quantity_text), normal)],
+                [Paragraph("Condition:", normal), Paragraph(_ptext(_first_item_text("quality_condition", "N/A")), normal)],
+            ]
+            prop_table = Table(prop_rows, colWidths=[32*mm, 146*mm])
+            prop_table.setStyle(TableStyle([("VALIGN", (0,0), (-1,-1), "TOP"), ("LEFTPADDING", (0,0), (-1,-1), 0), ("BOTTOMPADDING", (0,0), (-1,-1), 6)]))
+            story.append(prop_table)
+        else:
+            story.append(Paragraph(f"Item Description: {len(items)} listed item lines. Full details are shown below.", normal))
+
+        data = [[Paragraph("No.", cell), Paragraph("Item Description", cell), Paragraph("Colour", cell), Paragraph("Qty", cell), Paragraph("Unit", cell), Paragraph("Condition", cell), Paragraph("Serial / Asset Tag", cell), Paragraph("Remarks", cell)]]
+        for idx, it in enumerate(items.itertuples(), 1):
+            data.append([
+                str(idx), Paragraph(_ptext(getattr(it, "item_description", "")), cell), _clean(getattr(it, "colour", ""), "-"), _qty_text(getattr(it, "quantity", "")), _clean(getattr(it, "unit_of_measure", ""), "-"),
+                _clean(getattr(it, "quality_condition", ""), "-"), Paragraph(_ptext(" / ".join([x for x in [_clean(getattr(it, "serial_number", "")), _clean(getattr(it, "asset_tag", ""))] if x]) or "-"), cell), Paragraph(_ptext(getattr(it, "remarks", "") or getattr(it, "handling_instruction", "") or "-"), cell)
+            ])
+        item_table = Table(data, colWidths=[8*mm, 51*mm, 19*mm, 12*mm, 17*mm, 23*mm, 27*mm, 21*mm], repeatRows=1)
+        item_table.setStyle(TableStyle([
+            ("GRID", (0,0), (-1,-1), .25, colors.grey),
+            ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#f1f5f9")),
+            ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
+            ("FONTSIZE", (0,0), (-1,-1), 7),
+            ("VALIGN", (0,0), (-1,-1), "TOP"),
+            ("PADDING", (0,0), (-1,-1), 3),
+        ]))
+        story.append(item_table)
+
+        story.append(Paragraph("PURPOSE OF MOVEMENT", section_style))
+        purpose_sentence = row.get("purpose") or "movement as approved by Management"
+        story.append(Paragraph(f"The above-mentioned asset(s) is/are being moved for {escape(str(purpose_sentence))}. Security personnel are hereby requested to permit the approved movement.", body))
+
+        story.append(Paragraph("TRANSPORT DETAILS", section_style))
+        line_style = TableStyle([
+            ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
+            ("LEFTPADDING", (0,0), (-1,-1), 0),
+            ("RIGHTPADDING", (0,0), (-1,-1), 3),
+            ("BOTTOMPADDING", (0,0), (-1,-1), 7),
             ("LINEBELOW", (1,0), (1,-1), .55, colors.black),
             ("LINEBELOW", (3,0), (3,-1), .55, colors.black),
         ])
-        auth_rows = [
-            ["Authorizing Officer", row.get("approved_by") or blank, "Designation", display_role(row.get("approved_by_role")) or blank],
-            ["Signature", blank, "Date", _fmt_clean_date(row.get("approved_at")) or blank],
+        transport = [
+            [Paragraph("Driver's Name:", normal), Paragraph(_ptext(row.get("driver_name")), normal), Paragraph("Driver's Phone Number:", normal), Paragraph(_ptext(row.get("driver_phone")), normal)],
+            [Paragraph("Vehicle Number:", normal), Paragraph(_ptext(row.get("vehicle_number")), normal), Paragraph("Receiver Name:", normal), Paragraph(_ptext(row.get("receiver_name")), normal)],
         ]
-        story.append(Spacer(1, 6)); story.append(Paragraph("AUTHORIZATION", h))
-        story.append(Table(auth_rows, colWidths=[35*mm, 57*mm, 35*mm, 57*mm], style=form_style))
-        sec_rows = [
-            ["Security Officer Name", blank, "Gate Verification Time", blank],
-            ["Exit/Entry Confirmation", blank, "Security Signature", blank],
+        story.append(Table(transport, colWidths=[33*mm, 55*mm, 42*mm, 48*mm], style=line_style))
+
+        story.append(Paragraph("AUTHORIZATION", section_style))
+        story.append(Paragraph("I hereby certify that the movement of the above company property has been duly approved and authorized.", body))
+        auth = [
+            [Paragraph("Authorizing Officer:", normal), Paragraph(_ptext(row.get("approved_by")), normal), Paragraph("Designation:", normal), Paragraph(_ptext(display_role(row.get("approved_by_role"))), normal)],
+            [Paragraph("Signature:", normal), Paragraph("", normal), Paragraph("Date:", normal), Paragraph(_fmt_clean_date(row.get("approved_at")), normal)],
         ]
-        story.append(Spacer(1, 6)); story.append(Paragraph("SECURITY VERIFICATION", h))
-        story.append(Table(sec_rows, colWidths=[35*mm, 57*mm, 35*mm, 57*mm], style=form_style))
-        story.append(Spacer(1, 5)); story.append(Paragraph("This gateway pass is valid only for the listed items and approved movement date.", small))
+        story.append(Table(auth, colWidths=[35*mm, 54*mm, 27*mm, 62*mm], style=line_style))
+
+        story.append(Paragraph("SECURITY VERIFICATION", section_style))
+        security = [
+            [Paragraph("Security Officer Name:", normal), Paragraph("", normal), Paragraph("Gate Verification Time:", normal), Paragraph("", normal)],
+            [Paragraph("Exit / Entry Confirmation:", normal), Paragraph("", normal), Paragraph("Security Signature:", normal), Paragraph("", normal)],
+        ]
+        story.append(Table(security, colWidths=[42*mm, 46*mm, 44*mm, 46*mm], style=line_style))
+        story.append(Spacer(1, 7))
+        story.append(Paragraph("Consultancy Unit, Rivers State University, Nkpolu-Oroworokwo, Port Harcourt, Rivers State", ParagraphStyle("gp_footer_addr", parent=normal, alignment=1, fontSize=8)))
+        story.append(Paragraph("Email: info@cmotd.org &nbsp;&nbsp; Phone NO.: +2349163505000", ParagraphStyle("gp_footer_contact", parent=normal, alignment=1, fontSize=8)))
         doc.build(story)
         run_query("UPDATE gateway_passes SET status='Generated', next_role=NULL, generated_at=?, generated_file_path=?, updated_at=? WHERE id=?", (now_iso(), str(path), now_iso(), gateway_pass_id))
         log_gateway_event(gateway_pass_id, "Gateway Pass Generated", "Generated", str(path))
@@ -7024,7 +7094,6 @@ def generate_gateway_pass_document(gateway_pass_id: int) -> str | None:
     except Exception as exc:
         st.error(f"Could not generate PDF gateway pass: {exc}")
         return None
-
 
 def gateway_pass_register(where_sql: str, params: tuple | list, title: str, allow_submit: bool = False, allow_generate: bool = False, key_prefix: str = "gp_register"):
     st.subheader(title)
@@ -7059,7 +7128,7 @@ def gateway_pass_register(where_sql: str, params: tuple | list, title: str, allo
         if ready:
             render_gateway_pass_preview(gp_id)
         else:
-            st.info("The final preview and Generate button unlock after approval by Procurement Manager, Admin, or Approver / MD.")
+            st.info("The final preview and Generate button unlock after final approval by Admin or Approver / MD.")
         if st.button("Generate Final Gateway Pass PDF", type="primary", key=f"{key_prefix}_generate_cmd_{gp_id}", disabled=not ready):
             path = generate_gateway_pass_document(gp_id)
             if path:
