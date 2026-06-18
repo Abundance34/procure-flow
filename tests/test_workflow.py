@@ -1,4 +1,14 @@
-from core.workflow import workflow_next_role, canonical_status, STATUS_SENT_REVIEW, STATUS_SUBMITTED_APPROVAL, STATUS_APPROVED, STATUS_COMPLETED
+from core.workflow import (
+    workflow_next_role,
+    gateway_next_role_for_status,
+    canonical_status,
+    STATUS_SENT_REVIEW,
+    STATUS_SUBMITTED_APPROVAL,
+    STATUS_APPROVED,
+    STATUS_COMPLETED,
+    STATUS_CLOSED,
+    STATUS_ARCHIVED,
+)
 
 
 def test_canonical_status_aliases():
@@ -10,4 +20,14 @@ def test_next_role_routing():
     assert workflow_next_role(STATUS_SENT_REVIEW) == "procurement_manager"
     assert workflow_next_role(STATUS_SUBMITTED_APPROVAL) == "approver"
     assert workflow_next_role(STATUS_APPROVED) == "finance"
-    assert workflow_next_role(STATUS_COMPLETED) == "auditor"
+    assert workflow_next_role("Paid") == "procurement_manager"
+    assert workflow_next_role(STATUS_COMPLETED) == "procurement_manager"
+    assert workflow_next_role(STATUS_CLOSED) == "auditor"
+    assert workflow_next_role(STATUS_ARCHIVED) == "auditor"
+
+
+def test_gateway_routing():
+    assert gateway_next_role_for_status(STATUS_SENT_REVIEW) == "procurement_manager"
+    assert gateway_next_role_for_status(STATUS_SUBMITTED_APPROVAL) == "approver"
+    assert gateway_next_role_for_status(STATUS_APPROVED) == "facility_manager"
+    assert gateway_next_role_for_status("Generated") is None

@@ -2,7 +2,7 @@
 
 ProcureFlow is a Streamlit-based internal procurement, finance, audit, reporting, income, and gateway-pass management application. This build hardens the workflow so every request follows the approved chain of command:
 
-**Utility Head / Facility Head -> Procurement Manager -> Approver/Admin -> Finance -> Receipt/Completion/History/Audit**
+**Utility Head / Facility Head -> Procurement Manager -> Approver/Admin -> Finance -> Procurement Closure -> History/Audit**
 
 Only **Admin** and **Approver / MD** can approve or reject workflow items. Finance can only act after approval.
 
@@ -48,7 +48,9 @@ The app now stores and uses `next_role` routing columns. Manual Admin linking is
 | Utility Head sends draft | Sent for Procurement Review | `procurement_manager` |
 | Procurement submits valid item | Submitted for Approval | `approver` |
 | Approver/Admin approves | Approved / Awaiting Payment | `finance` |
-| Finance pays/uploads receipt | Completed / auditor route | `auditor` |
+| Finance pays/uploads receipt | Paid / Receipt Uploaded | `procurement_manager` |
+| Procurement Manager completes/closes | Completed / Closed | `procurement_manager` then `auditor` |
+| Record archived | Archived | `auditor` |
 
 ### Dashboard KPIs
 
@@ -105,6 +107,13 @@ Auditor, Admin, Approver, Procurement Manager, Finance, and Utility Head / Facil
 Important actions are logged, including draft creation/edit/delete, sent for review, reviewed, returned, submitted for approval, approved/rejected, sent to finance, paid, receipt uploaded, completed, gateway pass generated, Excel report download, income entry creation, and login/logout where available.
 
 ---
+
+
+### Architecture Correction in This Build
+
+This version removes the most dangerous command-chain inconsistency: workflow routing is no longer defined separately by different screens. `core/workflow.py` is now the authoritative status-to-next-role map for purchase requests and gateway passes. `core/db.py` applies that map during status transitions, and `services/request_service.py`, `services/gateway_service.py`, `services/finance_service.py`, and `services/notification_service.py` now provide UI-free command functions for future refactoring.
+
+The large `modules/role_workspaces.py` file remains for Streamlit compatibility, but its final workflow helper delegates to `core.workflow` rather than maintaining an independent routing table.
 
 ## Project Structure
 

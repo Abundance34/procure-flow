@@ -15,7 +15,7 @@ from core.auth import change_password_panel, has_permission, hash_password
 from core.db import (
     BACKUP_DIR, DB_PATH, add_workflow_event, active_delegation, create_activity_log,
     create_notification, df_query, json_dump, log_audit, make_ref, month_key, notify,
-    notify_related_users, now_iso, run_insert, run_query, transition_request_status, email_delivery_ready
+    notify_related_users, now_iso, run_insert, run_query, transition_request_status, transition_gateway_pass_status, email_delivery_ready
 )
 from core.legacy_import import bundled_legacy_zip_path, import_procurement_zip, import_uploaded_zip
 from core.ocr import duplicate_candidates, extract_text, match_invoice_to_po, parse_ocr_text
@@ -3615,7 +3615,6 @@ def _gateway_approve(gateway_pass_id: int, decision: str, note: str):
         title = "Gateway Pass Returned"
         msg = f"{row['pass_number']} was returned for correction. Reason: {note}"
     run_query("INSERT INTO gateway_pass_approvals (gateway_pass_id, approver_user_id, approver_role, decision, note, created_at) VALUES (?, ?, ?, ?, ?, ?)", (gateway_pass_id, user()["id"], user()["role"], decision_label, note, now_iso()))
-    log_gateway_event(gateway_pass_id, f"Gateway Pass {decision_label}", decision_label, note)
     _notify_gateway_event({**row.to_dict(), "id": gateway_pass_id}, title, msg, target="facility", importance="High")
     _rerun_success(f"Gateway pass {decision_label.lower()}.")
 
@@ -4910,7 +4909,6 @@ def _gateway_approve(gateway_pass_id: int, decision: str, note: str):
         run_query("UPDATE gateway_passes SET status='Returned for Correction', rejection_reason=?, updated_at=? WHERE id=?", (note, now_iso(), gateway_pass_id))
         decision_label = "Returned for Correction"; title = "Gateway Pass Returned"; msg = f"{row['pass_number']} was returned for correction. Reason: {note}"
     run_query("INSERT INTO gateway_pass_approvals (gateway_pass_id, approver_user_id, approver_role, decision, note, created_at) VALUES (?, ?, ?, ?, ?, ?)", (gateway_pass_id, user()["id"], user()["role"], decision_label, note, now_iso()))
-    log_gateway_event(gateway_pass_id, f"Gateway Pass {decision_label}", decision_label, note)
     action_label = "Ready to Generate" if decision_label == "Approved" else "Open Gateway Pass"
     create_notification(int(row["facility_manager_user_id"]), None, title, msg, "Gateway Pass", gateway_pass_id, "High", ["in_app", "browser_push"], action_label=action_label)
     _notify_auditors(title, msg, "Gateway Pass", gateway_pass_id)
@@ -5894,7 +5892,7 @@ from core.permissions import (
     can_delete_draft, can_edit_own_draft, is_read_only,
 )
 from core.report_service import build_excel_workbook, excel_mime
-from core.workflow import normalize_status, next_role_for_status
+from core.workflow import normalize_status, next_role_for_status, gateway_next_role_for_status
 from core.ui import interactive_chart, format_kpi_value
 
 # Business-approved statuses. Legacy values remain accepted by queries and migrations.
@@ -5933,34 +5931,17 @@ def _is_utility() -> bool:
 
 
 def _next_role_for_status(status: str) -> str | None:
-    return {
-        "Sent for Procurement Review": "procurement_manager",
-        "Submitted to Procurement Manager": "procurement_manager",
-        "Submitted": "procurement_manager",
-        "Procurement Review": "procurement_manager",
-        "Reviewed by Procurement": "procurement_manager",
-        "Requires Sourcing": "procurement_manager",
-        "Vendor Quote Collection": "procurement_manager",
-        "Vendor Recommendation": "procurement_manager",
-        "Submitted for Approval": "approver",
-        "Pending Approver/MD Approval": "approver",
-        "Pending Approval": "approver",
-        "Approved": "finance",
-        "Awaiting Payment": "finance",
-        "Approved for Payment": "finance",
-        # After Finance records payment/receipt, Procurement Manager owns
-        # final operational closure: Completed -> Closed -> Archived.
-        "Paid": "procurement_manager",
-        "Receipt Uploaded": "procurement_manager",
-        "Payment Submitted for Verification": "procurement_manager",
-        "Completed": "procurement_manager",
-        "Closed": "procurement_manager",
-        "Archived": "auditor",
-    }.get(status)
+    """Compatibility wrapper around the centralized request workflow map.
+
+    Older UI sections call this helper, but routing now lives in
+    core.workflow so all roles share one command-chain source of truth.
+    """
+    return next_role_for_status(status)
 
 
 def _set_next_role(entity_table: str, entity_id: int, status: str):
-    next_role = _next_role_for_status(status)
+    """Set next_role using the centralized workflow map for the entity type."""
+    next_role = gateway_next_role_for_status(status) if entity_table == "gateway_passes" else next_role_for_status(status)
     try:
         if next_role and "next_role" in __import__("core.db", fromlist=["table_columns"]).table_columns(entity_table):
             run_query(f"UPDATE {entity_table} SET next_role=? WHERE id=?", (next_role, entity_id))
@@ -6759,8 +6740,7 @@ def submit_gateway_pass(gateway_pass_id: int):
         st.error("At least one item line is required before submission."); return
     if (items["quantity"].fillna(0) <= 0).any() or items["unit_of_measure"].fillna("").eq("").any():
         st.error("Every item must include quantity > 0 and unit."); return
-    run_query("UPDATE gateway_passes SET status='Sent for Procurement Review', next_role='procurement_manager', submitted_at=?, updated_at=? WHERE id=?", (now_iso(), now_iso(), gateway_pass_id))
-    log_gateway_event(gateway_pass_id, "Sent for Procurement Review", "Sent for Procurement Review", "Submitted to Procurement Manager")
+    transition_gateway_pass_status(gateway_pass_id, "Sent for Procurement Review", "Sent for Procurement Review", "Submitted to Procurement Manager", user()["id"], user()["role"])
     create_notification(None, "Procurement Manager", "Gateway pass sent for review", f"{row['pass_number']} requires Procurement Manager review before final approval.", "Gateway Pass", gateway_pass_id, "High", ["in_app", "browser_push"], action_label="Review Gateway Pass")
     create_notification(int(row["facility_manager_user_id"]), None, "Gateway pass submitted to Procurement Manager", f"{row['pass_number']} was sent to Procurement Manager for review.", "Gateway Pass", gateway_pass_id, "Normal", ["in_app"], action_label="Open Gateway Pass")
     _notify_auditors("Gateway pass sent for review", f"{row['pass_number']} was sent to Procurement Manager for review.", "Gateway Pass", gateway_pass_id)
@@ -6798,16 +6778,15 @@ def _gateway_approve(gateway_pass_id: int, decision: str, note: str):
         st.error("A rejection or return reason is required."); return
     if decision == "Approved":
         # Final approval hands the record back to Utility Head / Facility Head for preview/generation.
-        run_query("UPDATE gateway_passes SET status='Approved', next_role='facility_manager', approved_at=?, approved_by_user_id=?, approved_by_role=?, approval_note=?, updated_at=? WHERE id=?", (now_iso(), user()["id"], role, note or "Approved.", now_iso(), gateway_pass_id))
+        transition_gateway_pass_status(gateway_pass_id, "Approved", "Gateway Pass Approved", note or "Approved.", user()["id"], role)
         decision_label = "Approved"; title = "Gateway Pass Approved - Ready to Generate"; msg = f"{row['pass_number']} has been approved by {display_role(role)}. Open Gateway Pass > Ready to Generate to preview and download it."
     elif decision == "Rejected":
-        run_query("UPDATE gateway_passes SET status='Rejected', next_role=NULL, rejected_at=?, rejected_by_user_id=?, rejection_reason=?, updated_at=? WHERE id=?", (now_iso(), user()["id"], note, now_iso(), gateway_pass_id))
+        transition_gateway_pass_status(gateway_pass_id, "Rejected", "Gateway Pass Rejected", note, user()["id"], role)
         decision_label = "Rejected"; title = "Gateway Pass Rejected"; msg = f"{row['pass_number']} was rejected. Reason: {note}"
     else:
-        run_query("UPDATE gateway_passes SET status='Returned for Correction', next_role='facility_manager', rejection_reason=?, updated_at=? WHERE id=?", (note, now_iso(), gateway_pass_id))
+        transition_gateway_pass_status(gateway_pass_id, "Returned for Correction", "Gateway Pass Returned for Correction", note, user()["id"], role)
         decision_label = "Returned for Correction"; title = "Gateway Pass Returned"; msg = f"{row['pass_number']} was returned for correction. Reason: {note}"
     run_query("INSERT INTO gateway_pass_approvals (gateway_pass_id, approver_user_id, approver_role, decision, note, created_at) VALUES (?, ?, ?, ?, ?, ?)", (gateway_pass_id, user()["id"], role, decision_label, note, now_iso()))
-    log_gateway_event(gateway_pass_id, f"Gateway Pass {decision_label}", decision_label, note)
     action_label = "Ready to Generate" if decision_label == "Approved" else "Open Gateway Pass"
     create_notification(int(row["facility_manager_user_id"]), None, title, msg, "Gateway Pass", gateway_pass_id, "High", ["in_app", "browser_push"], action_label=action_label)
     if decision_label == "Approved":
@@ -6839,19 +6818,16 @@ def gateway_pass_review_queue(title: str, admin_mode: bool = False):
         st.info("Procurement Manager reviews gateway passes and submits valid ones to Approver / MD. There is no Procurement Manager approval button.")
         c1, c2, c3 = st.columns(3)
         if c1.button("Mark Reviewed", key=f"gp_pm_reviewed_{gp_id}"):
-            run_query("UPDATE gateway_passes SET status='Reviewed by Procurement', next_role='procurement_manager', reviewed_by_user_id=?, reviewed_at=?, procurement_review_note=?, updated_at=? WHERE id=?", (user()["id"], now_iso(), note or "Reviewed by Procurement Manager", now_iso(), gp_id))
-            log_gateway_event(gp_id, "Reviewed by Procurement", "Reviewed by Procurement", note)
+            transition_gateway_pass_status(gp_id, "Reviewed by Procurement", "Reviewed by Procurement", note or "Reviewed by Procurement Manager", user()["id"], user()["role"])
             _notify_auditors("Gateway pass reviewed by Procurement Manager", f"{row['pass_number']} was reviewed by Procurement Manager.", "Gateway Pass", gp_id)
             _rerun_success("Gateway pass marked reviewed by Procurement Manager.")
         if c2.button("Return for Correction", key=f"gp_pm_return_{gp_id}"):
             if not note.strip(): st.error("Please enter a correction reason."); return
-            run_query("UPDATE gateway_passes SET status='Returned for Correction', next_role='facility_manager', rejection_reason=?, updated_at=? WHERE id=?", (note, now_iso(), gp_id))
-            log_gateway_event(gp_id, "Returned for Correction", "Returned for Correction", note)
+            transition_gateway_pass_status(gp_id, "Returned for Correction", "Returned for Correction", note, user()["id"], user()["role"])
             _notify_gateway_event({**row.to_dict(), "id": gp_id}, "Gateway pass returned", f"{row['pass_number']} was returned for correction. {note}", target="facility", importance="High")
             _rerun_success("Gateway pass returned for correction.")
         if c3.button("Submit to Approver / MD", type="primary", key=f"gp_pm_submit_approver_{gp_id}"):
-            run_query("UPDATE gateway_passes SET status='Submitted for Approval', next_role='approver', reviewed_by_user_id=?, reviewed_at=?, procurement_review_note=?, updated_at=? WHERE id=?", (user()["id"], now_iso(), note or "Submitted for final approval", now_iso(), gp_id))
-            log_gateway_event(gp_id, "Submitted for Approval", "Submitted for Approval", note)
+            transition_gateway_pass_status(gp_id, "Submitted for Approval", "Submitted for Approval", note or "Submitted for final approval", user()["id"], user()["role"])
             create_notification(None, "Approver", "Gateway pass pending final approval", f"{row['pass_number']} requires final approval from Approver / MD.", "Gateway Pass", gp_id, "High", ["in_app", "browser_push"], action_label="Review Gateway Pass")
             create_notification(None, "Admin", "Gateway pass pending final approval", f"{row['pass_number']} requires final approval/oversight.", "Gateway Pass", gp_id, "Important", ["in_app"], action_label="Gateway Pass Management")
             create_notification(int(row["facility_manager_user_id"]), None, "Gateway pass submitted for final approval", f"{row['pass_number']} was reviewed by Procurement Manager and sent to Approver / MD.", "Gateway Pass", gp_id, "Normal", ["in_app"], action_label="Open Gateway Pass")

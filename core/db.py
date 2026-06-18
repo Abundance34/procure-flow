@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import os
 import smtplib
@@ -23,6 +25,24 @@ for folder in [DATA_DIR, ATTACHMENT_DIR, IMPORT_DIR, BACKUP_DIR]:
 
 _DB_INIT_DONE = False
 
+
+
+def _seed_hash_password(password: str) -> str:
+    """Local PBKDF2 password hash for DB seeding without importing core.auth.
+
+    core.auth imports core.db, so importing hash_password here would create a
+    circular import during init_db(). Keep the wire format identical.
+    """
+    if password is None:
+        password = ""
+    iterations = 260_000
+    salt = os.urandom(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
+    return "pbkdf2_sha256$%d$%s$%s" % (
+        iterations,
+        base64.b64encode(salt).decode("ascii"),
+        base64.b64encode(digest).decode("ascii"),
+    )
 
 def now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
@@ -1132,62 +1152,106 @@ def transition_request_status(
     original_approver_role: str | None = None,
     payment_status: str | None = None,
 ):
+    """Move a purchase request through the command chain atomically.
+
+    This function is the database-level workflow authority for purchase
+    requests.  Older screens may still call it through local wrappers, but the
+    status -> next_role/payment_status/timestamp decisions are centralized here
+    so all role workspaces communicate consistently.
+    """
+    from core.workflow import request_routing_for_status
+
     rows = run_query("SELECT * FROM purchase_requests WHERE id=?", (request_id,), fetch=True)
     if not rows:
         return
+
     old = dict(rows[0])
+    routing = request_routing_for_status(new_status)
+    canonical_status = routing.canonical_status
+    resolved_payment_status = payment_status if payment_status is not None else routing.payment_status
+    cols = table_columns("purchase_requests")
+
     update_bits = ["status=?", "updated_at=?"]
-    params: list[Any] = [new_status, now_iso()]
-    if payment_status is not None and "payment_status" in table_columns("purchase_requests"):
+    params: list[Any] = [canonical_status, now_iso()]
+
+    if "next_role" in cols:
+        if routing.next_role:
+            update_bits.append("next_role=?")
+            params.append(routing.next_role)
+        else:
+            update_bits.append("next_role=NULL")
+
+    if resolved_payment_status is not None and "payment_status" in cols:
         update_bits.append("payment_status=?")
-        params.append(payment_status)
+        params.append(resolved_payment_status)
+
+    # Standard timestamps/actor stamps.  Guard each column so legacy/demo
+    # databases migrate safely without breaking older tables.
+    if canonical_status == "Sent for Procurement Review" and "submitted_at" in cols:
+        update_bits.append("submitted_at=COALESCE(submitted_at, ?)")
+        params.append(now_iso())
+    if canonical_status == "Approved":
+        if "approved_at" in cols:
+            update_bits.append("approved_at=?")
+            params.append(now_iso())
+        if "approved_by_user_id" in cols:
+            update_bits.append("approved_by_user_id=?")
+            params.append(actor_user_id)
+        if "approved_by_role" in cols:
+            update_bits.append("approved_by_role=?")
+            params.append(actor_role)
+    if canonical_status in {"Paid", "Receipt Uploaded", "Payment Submitted for Verification", "Completed", "Closed", "Archived"} and "paid_at" in cols:
+        update_bits.append("paid_at=COALESCE(paid_at, ?)")
+        params.append(now_iso())
+    if canonical_status in {"Receipt Uploaded", "Payment Submitted for Verification"} and "receipt_uploaded_at" in cols:
+        update_bits.append("receipt_uploaded_at=COALESCE(receipt_uploaded_at, ?)")
+        params.append(now_iso())
+    if canonical_status in {"Completed", "Closed", "Archived"} and "completed_at" in cols:
+        update_bits.append("completed_at=COALESCE(completed_at, ?)")
+        params.append(now_iso())
+
     params.append(request_id)
     run_query(f"UPDATE purchase_requests SET {', '.join(update_bits)} WHERE id=?", params)
-    add_workflow_event("Purchase Request", request_id, event, new_status, note, actor_user_id)
-    create_activity_log(actor_user_id, actor_role, event, "Purchase Request", request_id, f"{old.get('request_no')} moved from {old.get('status')} to {new_status}", note, "workflow", old.get("requested_by"))
-    if event.lower().startswith(("approved", "rejected", "returned")) or new_status in {"Approved", "Rejected", "Returned", "Returned to Facility Manager"}:
+
+    add_workflow_event("Purchase Request", request_id, event, canonical_status, note, actor_user_id)
+    create_activity_log(
+        actor_user_id,
+        actor_role,
+        event,
+        "Purchase Request",
+        request_id,
+        f"{old.get('request_no')} moved from {old.get('status')} to {canonical_status}",
+        note,
+        "workflow",
+        old.get("requested_by"),
+    )
+
+    if event.lower().startswith(("approved", "rejected", "returned")) or canonical_status in {"Approved", "Rejected", "Returned for Correction"}:
         run_query(
             """
             INSERT INTO approval_history (entity_type, entity_id, action, status_before, status_after, reason, user_id, approved_by_user_id, approved_by_role, approval_mode, delegation_reason, original_approver_role, note, created_at)
             VALUES ('Purchase Request', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (request_id, event, old.get("status"), new_status, note, actor_user_id, actor_user_id, actor_role, approval_mode, delegation_reason, original_approver_role, note, now_iso()),
+            (request_id, event, old.get("status"), canonical_status, note, actor_user_id, actor_user_id, actor_role, approval_mode, delegation_reason, original_approver_role, note, now_iso()),
         )
-    log_audit(event, "Purchase Request", request_id, note, actor_user_id, actor_role, before_values={"status": old.get("status")}, after_values={"status": new_status, "payment_status": payment_status})
+
+    log_audit(
+        event,
+        "Purchase Request",
+        request_id,
+        note,
+        actor_user_id,
+        actor_role,
+        before_values={"status": old.get("status"), "next_role": old.get("next_role")},
+        after_values={"status": canonical_status, "next_role": routing.next_role, "payment_status": resolved_payment_status},
+    )
     notify_related_users(
         request_id,
-        f"Request {new_status}",
-        f"{old.get('request_no')} is now {new_status}. {note or ''}".strip(),
-        include_finance=(new_status in {"Approved", "Finance Review", "Approved for Payment", "Paid"}),
-        include_procurement=(new_status in {"Submitted", "Approved", "Returned", "Paid"}),
+        f"Request {canonical_status}",
+        f"{old.get('request_no')} is now {canonical_status}. {note or ''}".strip(),
+        include_finance=(routing.next_role == "finance"),
+        include_procurement=(routing.next_role == "procurement_manager" or canonical_status in {"Returned for Correction"}),
     )
-
-
-def active_delegation(primary_role: str = "Approver", delegate_role: str = "Procurement Manager"):
-    today = date.today().isoformat()
-    rows = run_query(
-        """
-        SELECT * FROM approval_delegations
-        WHERE primary_role=? AND delegate_role=? AND enabled=1
-          AND (start_date IS NULL OR start_date='' OR start_date<=?)
-          AND (end_date IS NULL OR end_date='' OR end_date>=?)
-        ORDER BY updated_at DESC, created_at DESC LIMIT 1
-        """,
-        (primary_role, delegate_role, today, today),
-        fetch=True,
-    )
-    return dict(rows[0]) if rows else None
-
-
-def _seed_hash_password(password: str) -> str:
-    # Same PBKDF2-HMAC-SHA256 format used by core.auth, duplicated here so
-    # database initialization can run without importing Streamlit.
-    import base64, hashlib, os
-    iterations = 260_000
-    salt = os.urandom(16)
-    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
-    return f"pbkdf2_sha256${iterations}${base64.b64encode(salt).decode('ascii')}${base64.b64encode(digest).decode('ascii')}"
-
 
 
 # ---------------- Phase 2: push notifications, availability, gateway passes ----------------
@@ -2117,6 +2181,99 @@ def notify(user_id: int | None, role: str | None, title: str, message: str, enti
     return create_notification(user_id=user_id, role=role, title=title, message=message, entity_type=entity_type, entity_id=entity_id, importance="Normal", channels=["in_app"])
 
 
+def transition_gateway_pass_status(
+    gateway_pass_id: int,
+    new_status: str,
+    event: str,
+    note: str | None = None,
+    actor_user_id: int | None = None,
+    actor_role: str | None = None,
+):
+    """Move a gateway pass through the command chain using central routing.
+
+    Procurement Manager review and Approver/Admin final approval now share the
+    same status/next_role logic used by badges, notification targets, and audit
+    history.  UI code can still perform custom validation before calling this.
+    """
+    from core.workflow import gateway_routing_for_status
+
+    rows = run_query("SELECT * FROM gateway_passes WHERE id=?", (gateway_pass_id,), fetch=True)
+    if not rows:
+        return
+    old = dict(rows[0])
+    routing = gateway_routing_for_status(new_status)
+    canonical_status = routing.canonical_status
+    cols = table_columns("gateway_passes")
+
+    update_bits = ["status=?", "updated_at=?"]
+    params: list[Any] = [canonical_status, now_iso()]
+    if "next_role" in cols:
+        if routing.next_role:
+            update_bits.append("next_role=?")
+            params.append(routing.next_role)
+        else:
+            update_bits.append("next_role=NULL")
+    if canonical_status == "Sent for Procurement Review" and "submitted_at" in cols:
+        update_bits.append("submitted_at=COALESCE(submitted_at, ?)")
+        params.append(now_iso())
+    if canonical_status == "Reviewed by Procurement":
+        if "reviewed_by_user_id" in cols:
+            update_bits.append("reviewed_by_user_id=?")
+            params.append(actor_user_id)
+        if "reviewed_at" in cols:
+            update_bits.append("reviewed_at=?")
+            params.append(now_iso())
+        if "procurement_review_note" in cols:
+            update_bits.append("procurement_review_note=?")
+            params.append(note)
+    if canonical_status == "Approved":
+        if "approved_at" in cols:
+            update_bits.append("approved_at=?")
+            params.append(now_iso())
+        if "approved_by_user_id" in cols:
+            update_bits.append("approved_by_user_id=?")
+            params.append(actor_user_id)
+        if "approved_by_role" in cols:
+            update_bits.append("approved_by_role=?")
+            params.append(actor_role)
+        if "approval_note" in cols:
+            update_bits.append("approval_note=?")
+            params.append(note or "Approved.")
+    if canonical_status == "Rejected":
+        if "rejected_at" in cols:
+            update_bits.append("rejected_at=?")
+            params.append(now_iso())
+        if "rejected_by_user_id" in cols:
+            update_bits.append("rejected_by_user_id=?")
+            params.append(actor_user_id)
+        if "rejection_reason" in cols:
+            update_bits.append("rejection_reason=?")
+            params.append(note)
+    if canonical_status == "Returned for Correction" and "rejection_reason" in cols:
+        update_bits.append("rejection_reason=?")
+        params.append(note)
+    if canonical_status in {"Generated", "Completed"} and "generated_at" in cols:
+        update_bits.append("generated_at=COALESCE(generated_at, ?)")
+        params.append(now_iso())
+    if canonical_status in {"Generated", "Downloaded", "Completed"} and "completed_at" in cols:
+        update_bits.append("completed_at=COALESCE(completed_at, ?)")
+        params.append(now_iso())
+
+    params.append(gateway_pass_id)
+    run_query(f"UPDATE gateway_passes SET {', '.join(update_bits)} WHERE id=?", params)
+    log_gateway_pass_event(gateway_pass_id, event, canonical_status, note, actor_user_id)
+    log_audit(
+        event,
+        "Gateway Pass",
+        gateway_pass_id,
+        note,
+        actor_user_id,
+        actor_role,
+        before_values={"status": old.get("status"), "next_role": old.get("next_role")},
+        after_values={"status": canonical_status, "next_role": routing.next_role},
+    )
+
+
 def transition_payment_status(payment_id: int, new_status: str, note: str | None = None, actor_user_id: int | None = None, actor_role: str | None = None, proof_path: str | None = None):
     rows = run_query("SELECT * FROM payments WHERE id=?", (payment_id,), fetch=True)
     if not rows:
@@ -2338,7 +2495,8 @@ def ensure_command_chain_schema():
         run_query("UPDATE purchase_requests SET next_role='procurement_manager' WHERE status IN ('Submitted','Submitted to Procurement Manager','Sent for Procurement Review') AND (next_role IS NULL OR next_role='')")
         run_query("UPDATE purchase_requests SET next_role='approver' WHERE status IN ('Pending Approval','Pending Approver/MD Approval','Submitted for Approval') AND (next_role IS NULL OR next_role='')")
         run_query("UPDATE purchase_requests SET next_role='finance', payment_status=COALESCE(NULLIF(payment_status,''),'Approved for Payment') WHERE status IN ('Approved','Approved for Payment','Awaiting Payment') AND (next_role IS NULL OR next_role='')")
-        run_query("UPDATE purchase_requests SET next_role='auditor' WHERE status IN ('Paid','Completed','Closed') AND (next_role IS NULL OR next_role='')")
+        run_query("UPDATE purchase_requests SET next_role='procurement_manager' WHERE status IN ('Paid','Receipt Uploaded','Payment Submitted for Verification','Completed') AND (next_role IS NULL OR next_role='')")
+        run_query("UPDATE purchase_requests SET next_role='auditor' WHERE status IN ('Closed','Archived') AND (next_role IS NULL OR next_role='')")
         run_query("UPDATE gateway_passes SET next_role='procurement_manager' WHERE status IN ('Submitted','Pending Procurement Manager / Approver Review','Sent for Procurement Review','Reviewed by Procurement') AND (next_role IS NULL OR next_role='')")
         run_query("UPDATE gateway_passes SET next_role='approver' WHERE status IN ('Submitted for Approval','Pending Approval') AND (next_role IS NULL OR next_role='')")
         run_query("UPDATE gateway_passes SET next_role='facility_manager' WHERE status='Approved' AND (next_role IS NULL OR next_role='')")

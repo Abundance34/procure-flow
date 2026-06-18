@@ -1,5 +1,7 @@
-"""Service module placeholder kept intentionally thin for Streamlit compatibility.
+"""Report service compatibility wrapper.
 
-Business-critical rules are centralized in core.permissions, core.workflow and
-existing core.db transition helpers.
+The concrete report builders live in core.report_service so existing imports
+continue to work.  New UI modules should prefer core.report_service directly or
+add report orchestration functions here.
 """
+from core.report_service import *  # noqa: F401,F403

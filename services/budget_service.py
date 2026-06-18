@@ -1,5 +1,5 @@
-"""Service module placeholder kept intentionally thin for Streamlit compatibility.
+"""Budget service placeholder for budget-specific commands.
 
-Business-critical rules are centralized in core.permissions, core.workflow and
-existing core.db transition helpers.
+Budget calculations remain in the reporting/UI layer for now, but this module is
+kept as the expansion point for approval-aware budget checks.
 """
