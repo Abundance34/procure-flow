@@ -16,6 +16,9 @@ STATUS_DRAFT = "Draft"
 STATUS_SENT_REVIEW = "Sent for Procurement Review"
 STATUS_RETURNED = "Returned for Correction"
 STATUS_REVIEWED = "Reviewed by Procurement"
+STATUS_REQUIRES_SOURCING = "Requires Sourcing"
+STATUS_VENDOR_QUOTE_COLLECTION = "Vendor Quote Collection"
+STATUS_VENDOR_RECOMMENDATION = "Vendor Recommendation"
 STATUS_SUBMITTED_APPROVAL = "Submitted for Approval"
 STATUS_APPROVED = "Approved"
 STATUS_REJECTED = "Rejected"
@@ -32,6 +35,9 @@ STATUSES = [
     STATUS_SENT_REVIEW,
     STATUS_RETURNED,
     STATUS_REVIEWED,
+    STATUS_REQUIRES_SOURCING,
+    STATUS_VENDOR_QUOTE_COLLECTION,
+    STATUS_VENDOR_RECOMMENDATION,
     STATUS_SUBMITTED_APPROVAL,
     STATUS_APPROVED,
     STATUS_REJECTED,
@@ -53,9 +59,7 @@ LEGACY_STATUS_ALIASES = {
     "Procurement Review": STATUS_SENT_REVIEW,
     "PM Reviewing": STATUS_REVIEWED,
     "Accepted by Procurement Manager": STATUS_REVIEWED,
-    "Requires Sourcing": STATUS_REVIEWED,
-    "Vendor Quote Collection": STATUS_REVIEWED,
-    "Vendor Recommendation": STATUS_REVIEWED,
+    # Sourcing statuses are not aliases; they are actionable procurement queues.
     "Returned": STATUS_RETURNED,
     "Returned to Facility Manager": STATUS_RETURNED,
     "Pending Approver/MD Approval": STATUS_SUBMITTED_APPROVAL,
@@ -74,6 +78,9 @@ LEGACY_STATUS_ALIASES = {
 REQUEST_NEXT_ROLE_BY_STATUS = {
     STATUS_SENT_REVIEW: "procurement_manager",
     STATUS_REVIEWED: "procurement_manager",
+    STATUS_REQUIRES_SOURCING: "procurement_manager",
+    STATUS_VENDOR_QUOTE_COLLECTION: "procurement_manager",
+    STATUS_VENDOR_RECOMMENDATION: "procurement_manager",
     STATUS_SUBMITTED_APPROVAL: "approver",
     STATUS_APPROVED: "finance",
     STATUS_AWAITING_PAYMENT: "finance",
@@ -91,6 +98,9 @@ GATEWAY_NEXT_ROLE_BY_STATUS = {
     STATUS_DRAFT: "facility_manager",
     STATUS_SENT_REVIEW: "procurement_manager",
     STATUS_REVIEWED: "procurement_manager",
+    STATUS_REQUIRES_SOURCING: "procurement_manager",
+    STATUS_VENDOR_QUOTE_COLLECTION: "procurement_manager",
+    STATUS_VENDOR_RECOMMENDATION: "procurement_manager",
     STATUS_SUBMITTED_APPROVAL: "approver",
     STATUS_APPROVED: "facility_manager",
     STATUS_RETURNED: "facility_manager",

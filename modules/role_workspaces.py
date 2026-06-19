@@ -762,15 +762,34 @@ def imported_draft_review():
 # Sourcing and quotes
 
 def create_sourcing_for_request(request_id: int):
+    """Create or reopen the sourcing task for a request and keep it in the PM queue."""
     existing = df_query("SELECT id FROM sourcing_tasks WHERE request_id=?", (request_id,))
-    if not existing.empty: return int(existing.iloc[0]["id"])
-    pr = df_query("SELECT request_no, justification FROM purchase_requests WHERE id=?", (request_id,)).iloc[0]
-    src_no = make_ref("SRC")
-    sid = run_insert("INSERT INTO sourcing_tasks (sourcing_no, request_id, required_item_service, status, created_at, updated_at) VALUES (?, ?, ?, 'Open', ?, ?)", (src_no, request_id, pr["justification"], now_iso(), now_iso()))
-    run_query("UPDATE purchase_requests SET linked_sourcing_task_id=?, status='Vendor Quote Collection', updated_at=? WHERE id=?", (sid, now_iso(), request_id))
-    add_workflow_event("Sourcing Task", sid, "Created", "Open", src_no, user()["id"])
+    pr_rows = df_query("SELECT request_no, justification, status FROM purchase_requests WHERE id=?", (request_id,))
+    if pr_rows.empty:
+        st.error("Request not found for sourcing.")
+        return None
+    pr = pr_rows.iloc[0]
+    if not existing.empty:
+        sid = int(existing.iloc[0]["id"])
+    else:
+        src_no = make_ref("SRC")
+        sid = run_insert(
+            "INSERT INTO sourcing_tasks (sourcing_no, request_id, required_item_service, status, created_at, updated_at) VALUES (?, ?, ?, 'Open', ?, ?)",
+            (src_no, request_id, pr["justification"], now_iso(), now_iso()),
+        )
+        add_workflow_event("Sourcing Task", sid, "Created", "Open", src_no, user()["id"])
+    run_query("UPDATE purchase_requests SET linked_sourcing_task_id=?, next_role='procurement_manager', updated_at=? WHERE id=?", (sid, now_iso(), request_id))
+    if str(pr["status"]) not in ["Vendor Quote Collection", "Vendor Recommendation"]:
+        transition_request_status(
+            request_id,
+            "Vendor Quote Collection",
+            "Sourcing Required",
+            "Procurement Manager opened vendor quote collection for this request.",
+            user()["id"],
+            user()["role"],
+        )
+    create_notification(None, "Procurement Manager", "Sourcing task ready", f"{pr['request_no']} is ready for vendor quote collection.", "Sourcing Task", sid, "Important", ["in_app"], action_label="Open Sourcing")
     return sid
-
 
 def sourcing_page():
     st.subheader("Sourcing Tasks")
@@ -846,9 +865,10 @@ def quote_comparison(sid: int, allow_recommend=False):
         run_query("UPDATE vendor_quotes SET score=?, is_recommended=CASE WHEN id=? THEN 1 ELSE 0 END WHERE sourcing_task_id=?", (float(rec["score"]), int(rec["id"]), sid))
         run_query("UPDATE sourcing_tasks SET recommended_vendor_id=?, reason_for_recommendation=?, status='Vendor Recommendation', approval_status='Recommended', updated_at=? WHERE id=?", (int(rec["vendor_id"]) if pd.notna(rec["vendor_id"]) else None, f"Highest weighted score: {rec['score']}", now_iso(), sid))
         req = df_query("SELECT request_id FROM sourcing_tasks WHERE id=?", (sid,)).iloc[0]["request_id"]
-        run_query("UPDATE purchase_requests SET status='Vendor Recommendation', updated_at=? WHERE id=?", (now_iso(), int(req)))
+        run_query("UPDATE purchase_requests SET status='Vendor Recommendation', next_role='procurement_manager', updated_at=? WHERE id=?", (now_iso(), int(req)))
         add_workflow_event("Sourcing Task", sid, "Vendor Recommended", "Vendor Recommendation", rec["vendor"], user()["id"])
-        notify(None, "Approver", "Vendor recommendation ready", f"Recommended vendor: {rec['vendor']}", "Sourcing Task", sid)
+        create_notification(None, "Procurement Manager", "Vendor recommendation ready", f"Recommended vendor: {rec['vendor']}. Submit the recommendation to Approver/Admin when ready.", "Sourcing Task", sid, "Important", ["in_app"], action_label="Open Vendor Recommendation")
+        create_notification(None, "Admin", "Vendor recommendation prepared", f"Recommended vendor: {rec['vendor']}.", "Sourcing Task", sid, "Normal", ["in_app"])
         st.rerun()
 
 # Purchase Orders
@@ -3034,6 +3054,7 @@ def gateway_pass_preview_html(gateway_pass_id: int) -> str:
         <div><b>Movement Type:</b> {escape(_row_value(row, 'movement_type', 'N/A'))}</div>
         <div><b>Expected Movement Date:</b> {_fmt_date(_row_value(row, 'expected_movement_date'))}</div>
         <div><b>Expected Return Date:</b> {_fmt_date(_row_value(row, 'expected_return_date'))}</div>
+        <div><b>Actual Return Date:</b> {_fmt_date(_row_value(row, 'actual_return_date'))}</div>
         <div><b>Vehicle Number:</b> {escape(_row_value(row, 'vehicle_number', '________________'))}</div>
         <div><b>Driver's Name:</b> {escape(_row_value(row, 'driver_name', '________________'))}</div>
         <div><b>Driver's Phone Number:</b> {escape(_row_value(row, 'driver_phone', '________________'))}</div>
@@ -3045,19 +3066,19 @@ def gateway_pass_preview_html(gateway_pass_id: int) -> str:
       <h3>AUTHORIZATION</h3>
       <p>I hereby certify that the movement of the above company property has been duly approved and authorized.</p>
       <div class="signature-grid">
-        <div><b>Authorizing Officer:</b><span>{escape(_row_value(row, 'approved_by', '____________________________'))}</span></div>
-        <div><b>Designation:</b><span>{escape(_row_value(row, 'approved_by_role', '____________________________'))}</span></div>
-        <div><b>Signature:</b><span>____________________________</span></div>
+        <div><b>Authorizing Officer:</b><span>{_html_line_value(_row_value(row, 'approved_by'))}</span></div>
+        <div><b>Designation:</b><span>{_html_line_value(display_role(_row_value(row, 'approved_by_role')))}</span></div>
+        <div><b>Signature:</b><span></span></div>
         <div><b>Date:</b><span>{_fmt_date(_row_value(row, 'approved_at'))}</span></div>
       </div>
 
       <div class="security-box">
         <b>SECURITY VERIFICATION</b>
         <div class="signature-grid small">
-          <div>Security Officer Name: ____________________________</div>
-          <div>Gate Verification Time: ____________________________</div>
-          <div>Exit / Entry Confirmation: ____________________________</div>
-          <div>Signature: ____________________________</div>
+          <div><b>Security Officer Name:</b><span>{_html_line_value(_row_value(row, 'security_officer_name'))}</span></div>
+          <div><b>Gate Verification Time:</b><span>{_html_line_value(_row_value(row, 'gate_verification_time'))}</span></div>
+          <div><b>Exit / Entry Confirmation:</b><span>{_html_line_value(_row_value(row, 'exit_entry_confirmation'))}</span></div>
+          <div><b>Signature:</b><span>{_html_line_value(_row_value(row, 'security_signature'))}</span></div>
         </div>
       </div>
 
@@ -3465,6 +3486,97 @@ def gateway_pass_summary_df(where_sql: str = "", params: tuple | list = ()) -> p
     return df_query(sql, params)
 
 
+def _series_value(row: Any, key: str, default: str = "") -> str:
+    """Safely read a field from a pandas Series/dict and normalize empty values."""
+    try:
+        if hasattr(row, "index") and key not in row.index:
+            return default
+        return _clean(row.get(key), default)
+    except Exception:
+        return default
+
+
+def _date_or_default(value: Any, default_value: date | None = None) -> date:
+    default_value = default_value or date.today()
+    try:
+        text = _clean(value)
+        return pd.to_datetime(text).date() if text else default_value
+    except Exception:
+        return default_value
+
+
+def _html_line_value(value: Any) -> str:
+    """Return only the typed value; CSS draws the signing line so no double underline appears."""
+    return escape(_clean(value, ""))
+
+
+def gateway_pass_return_security_form(gateway_pass_id: int, key_prefix: str = "gp_security"):
+    """Allow the Facility/Utility owner to fill return-date and gate security fields.
+
+    These fields replace the blank dashes in the generated gate-pass template.
+    The form is intentionally available after approval/generation so gate/security
+    information can be completed without reopening the main draft workflow.
+    """
+    if not _is_utility():
+        return
+    row_df = df_query("SELECT * FROM gateway_passes WHERE id=?", (gateway_pass_id,))
+    if row_df.empty:
+        return
+    row = row_df.iloc[0]
+    if int(row.get("facility_manager_user_id") or 0) != int(user()["id"]):
+        return
+
+    with st.expander("Return Date & Security Verification Inputs", expanded=False):
+        st.caption("Use these tabs to fill the empty return/security lines before generating or re-generating the gateway pass.")
+        with st.form(f"{key_prefix}_form_{gateway_pass_id}"):
+            return_tab, security_tab = st.tabs(["Return Date", "Security Verification"])
+            with return_tab:
+                has_expected_return = bool(_series_value(row, "expected_return_date"))
+                return_required = st.checkbox("Return date applies", value=has_expected_return, key=f"{key_prefix}_return_required_{gateway_pass_id}")
+                expected_return = st.date_input(
+                    "Return date",
+                    value=_date_or_default(row.get("expected_return_date"), date.today() + timedelta(days=1)),
+                    key=f"{key_prefix}_expected_return_{gateway_pass_id}",
+                    disabled=not return_required,
+                )
+                has_actual_return = bool(_series_value(row, "actual_return_date"))
+                actual_return_applies = st.checkbox("Actual return date available", value=has_actual_return, key=f"{key_prefix}_actual_return_applies_{gateway_pass_id}")
+                actual_return = st.date_input(
+                    "Actual return date",
+                    value=_date_or_default(row.get("actual_return_date"), date.today()),
+                    key=f"{key_prefix}_actual_return_{gateway_pass_id}",
+                    disabled=not actual_return_applies,
+                )
+            with security_tab:
+                c1, c2 = st.columns(2)
+                security_officer = c1.text_input("Security Officer Name", value=_series_value(row, "security_officer_name"), key=f"{key_prefix}_security_name_{gateway_pass_id}")
+                gate_time = c2.text_input("Gate Verification Time", value=_series_value(row, "gate_verification_time"), placeholder="e.g. 04:30 PM", key=f"{key_prefix}_gate_time_{gateway_pass_id}")
+                c3, c4 = st.columns(2)
+                exit_entry = c3.text_input("Exit / Entry Confirmation", value=_series_value(row, "exit_entry_confirmation"), placeholder="e.g. Exit confirmed", key=f"{key_prefix}_exit_entry_{gateway_pass_id}")
+                security_signature = c4.text_input("Security Signature / Name", value=_series_value(row, "security_signature"), key=f"{key_prefix}_security_signature_{gateway_pass_id}")
+            saved = st.form_submit_button("Save Return/Security Details", type="primary")
+        if saved:
+            run_query(
+                """
+                UPDATE gateway_passes
+                SET expected_return_date=?, actual_return_date=?, security_officer_name=?, gate_verification_time=?, exit_entry_confirmation=?, security_signature=?, updated_at=?
+                WHERE id=?
+                """,
+                (
+                    expected_return.isoformat() if return_required else None,
+                    actual_return.isoformat() if actual_return_applies else None,
+                    security_officer.strip() or None,
+                    gate_time.strip() or None,
+                    exit_entry.strip() or None,
+                    security_signature.strip() or None,
+                    now_iso(),
+                    gateway_pass_id,
+                ),
+            )
+            log_gateway_event(gateway_pass_id, "Gateway Pass Return/Security Details Updated", row.get("status"), "Return date and security verification fields updated")
+            _rerun_success("Return date and security verification details saved.")
+
+
 def gateway_pass_detail(gateway_pass_id: int):
     gp = gateway_pass_summary_df("gp.id=?", (gateway_pass_id,))
     if gp.empty:
@@ -3476,7 +3588,7 @@ def gateway_pass_detail(gateway_pass_id: int):
     c2.metric("Status", row["status"])
     c3.metric("Movement", row["movement_type"])
     c4.metric("Destination", row["destination"] or "-")
-    info_cols = ["facility_manager", "department", "purpose", "origin_location", "destination", "expected_movement_date", "expected_return_date", "vehicle_number", "driver_name", "driver_phone", "receiver_name", "receiver_organization", "security_checkpoint", "approved_by", "approved_by_role", "approved_at"]
+    info_cols = ["facility_manager", "department", "purpose", "origin_location", "destination", "expected_movement_date", "expected_return_date", "actual_return_date", "vehicle_number", "driver_name", "driver_phone", "receiver_name", "receiver_organization", "security_checkpoint", "security_officer_name", "gate_verification_time", "exit_entry_confirmation", "security_signature", "approved_by", "approved_by_role", "approved_at"]
     st.dataframe(pd.DataFrame([{k: row.get(k, "") for k in info_cols if k in row.index}]), use_container_width=True)
     items = gateway_pass_items_df(gateway_pass_id)
     st.markdown("#### Item lines — quality, quantity and fragility")
@@ -4943,7 +5055,21 @@ def edit_gateway_pass_form(gateway_pass_id: int):
         checkpoint = c10.text_input("Security checkpoint", value=row["security_checkpoint"] or "", key=f"edit_gp_check_{gateway_pass_id}")
         submitted = st.form_submit_button("Save Gateway Pass Details")
     if submitted:
-        run_query("UPDATE gateway_passes SET department=?, movement_type=?, purpose=?, origin_location=?, destination=?, expected_movement_date=?, vehicle_number=?, driver_name=?, driver_phone=?, receiver_name=?, security_checkpoint=?, updated_at=? WHERE id=?", (dept, movement_type, purpose, origin, destination, expected_movement.isoformat(), vehicle, driver, driver_phone, receiver, checkpoint, now_iso(), gateway_pass_id))
+        run_query(
+            """
+            UPDATE gateway_passes
+            SET department=?, movement_type=?, purpose=?, origin_location=?, destination=?, expected_movement_date=?, expected_return_date=?, actual_return_date=?, vehicle_number=?, driver_name=?, driver_phone=?, receiver_name=?, receiver_organization=?, security_checkpoint=?, security_officer_name=?, gate_verification_time=?, exit_entry_confirmation=?, security_signature=?, updated_at=?
+            WHERE id=?
+            """,
+            (
+                dept, movement_type, purpose, origin, destination, expected_movement.isoformat(),
+                expected_return.isoformat() if return_required else None,
+                actual_return.isoformat() if actual_return_applies else None,
+                vehicle, driver, driver_phone, receiver, receiver_org, checkpoint,
+                security_officer.strip() or None, gate_time.strip() or None, exit_entry.strip() or None, security_signature.strip() or None,
+                now_iso(), gateway_pass_id,
+            ),
+        )
         log_gateway_event(gateway_pass_id, "Gateway Pass Edited", row["status"], "Details updated after draft/return")
         _rerun_success("Gateway pass details updated.")
     st.markdown("#### Edit Item Lines")
@@ -5547,6 +5673,8 @@ def create_request_form():
             st.error("Business justification and at least one item are required.")
             return
         _save_custom_value("department_project", dept); _save_custom_value("category", cat)
+        vendor_names = [v["name"] for v in vendor_details if v.get("name")]
+        vendor_pref_full = ", ".join(dict.fromkeys([v for v in [vendor_pref.strip(), *vendor_names] if v]))
         path, _ = save_upload(attachment, "requests")
         req_no = make_ref("PR")
         req_id = run_insert("""
@@ -6214,6 +6342,98 @@ def _request_line_items(state_key: str, prefix: str, default_category: str) -> t
     return items, estimated
 
 
+def _suggested_vendor_detail_inputs(prefix: str, default_category: str) -> list[dict[str, Any]]:
+    """Capture optional vendor details while a draft is being created.
+
+    Facility/Utility users and Procurement Managers can now add supplier names
+    and contact details at the point of drafting instead of leaving sourcing
+    users to recreate the vendor records later.
+    """
+    vendor_details: list[dict[str, Any]] = []
+    with st.expander("Suggested vendor details (optional)", expanded=False):
+        st.caption("Add known or suggested vendors now. These vendors are saved into the vendor register and become selectable later in Sourcing → Add Vendor Quote.")
+        count = st.number_input("Number of suggested vendors to capture", min_value=0, max_value=5, value=0, step=1, key=f"{prefix}_vendor_count")
+        for idx in range(int(count or 0)):
+            st.markdown(f"###### Suggested vendor {idx + 1}")
+            c1, c2, c3 = st.columns([1.4, 1, 1])
+            name = c1.text_input("Vendor name", key=f"{prefix}_vendor_name_{idx}")
+            phone = c2.text_input("Phone", key=f"{prefix}_vendor_phone_{idx}")
+            email = c3.text_input("Email", key=f"{prefix}_vendor_email_{idx}")
+            c4, c5 = st.columns([1.6, .8])
+            address = c4.text_area("Address / location", key=f"{prefix}_vendor_address_{idx}")
+            rating = c5.slider("Initial rating", 1, 5, 3, key=f"{prefix}_vendor_rating_{idx}")
+            notes = st.text_area("Vendor note / what they can supply", key=f"{prefix}_vendor_notes_{idx}")
+            if name.strip():
+                vendor_details.append({
+                    "name": name.strip(),
+                    "phone": phone.strip(),
+                    "email": email.strip(),
+                    "address": address.strip(),
+                    "rating": int(rating),
+                    "notes": notes.strip(),
+                    "category": default_category,
+                })
+    return vendor_details
+
+
+def _save_suggested_vendors_for_request(request_id: int, vendor_details: list[dict[str, Any]], category: str, source_label: str) -> list[str]:
+    """Create/update vendor-register entries and attach a plain-text summary to the request."""
+    if not vendor_details:
+        return []
+    names: list[str] = []
+    lines: list[str] = []
+    for vendor in vendor_details:
+        name = str(vendor.get("name") or "").strip()
+        if not name:
+            continue
+        phone = str(vendor.get("phone") or "").strip()
+        email = str(vendor.get("email") or "").strip()
+        address = str(vendor.get("address") or "").strip()
+        vendor_category = str(vendor.get("category") or category or "Other").strip()
+        notes = str(vendor.get("notes") or "").strip()
+        rating = int(vendor.get("rating") or 3)
+        run_query(
+            """
+            INSERT OR IGNORE INTO vendors (name, category, phone, email, address, rating, status, documents_json, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, 'Active', '[]', ?, ?)
+            """,
+            (name, vendor_category, phone, email, address, rating, now_iso(), now_iso()),
+        )
+        run_query(
+            """
+            UPDATE vendors
+            SET category=COALESCE(NULLIF(?, ''), category),
+                phone=COALESCE(NULLIF(?, ''), phone),
+                email=COALESCE(NULLIF(?, ''), email),
+                address=COALESCE(NULLIF(?, ''), address),
+                rating=?, updated_at=?
+            WHERE name=?
+            """,
+            (vendor_category, phone, email, address, rating, now_iso(), name),
+        )
+        names.append(name)
+        detail_bits = [name]
+        if phone:
+            detail_bits.append(f"phone: {phone}")
+        if email:
+            detail_bits.append(f"email: {email}")
+        if address:
+            detail_bits.append(f"address: {address}")
+        if notes:
+            detail_bits.append(f"note: {notes}")
+        lines.append("- " + "; ".join(detail_bits))
+    if names:
+        row = df_query("SELECT notes, status FROM purchase_requests WHERE id=?", (request_id,))
+        old_notes = str(row.iloc[0]["notes"] or "") if not row.empty else ""
+        status = str(row.iloc[0]["status"] or "Draft") if not row.empty else "Draft"
+        block = f"{source_label} suggested vendor details:\n" + "\n".join(lines)
+        combined = f"{old_notes}\n\n{block}".strip() if old_notes.strip() else block
+        run_query("UPDATE purchase_requests SET notes=?, vendor_preference=COALESCE(NULLIF(vendor_preference, ''), ?), updated_at=? WHERE id=?", (combined, ", ".join(names), now_iso(), request_id))
+        add_workflow_event("Purchase Request", request_id, "Suggested Vendors Captured", status, ", ".join(names), user()["id"])
+        log_audit("SUGGESTED_VENDORS_CAPTURED", "Purchase Request", request_id, {"vendors": names}, user()["id"], user()["role"])
+    return names
+
+
 def create_request_form():
     if not has_permission("create_request") or is_read_only(_current_role()):
         st.info("Your role can view requests but cannot create requests.")
@@ -6229,6 +6449,7 @@ def create_request_form():
     vendor_pref = c6.text_input("Vendor preference", key="req_vendor_pref_cmd")
     justification = st.text_area("Business justification", key="req_justification_cmd")
     attachment = st.file_uploader("Supporting document", type=["docx", "pdf", "jpg", "jpeg", "png", "xlsx"], key="req_attachment_cmd")
+    vendor_details = _suggested_vendor_detail_inputs("req_cmd", cat)
     items, estimated = _request_line_items("req_line_rows_cmd", "req_cmd", cat)
     st.metric("Estimated request value", format_kpi_value(money(estimated)))
     if st.button("Create Draft Request", type="primary", key="create_draft_request_cmd"):
@@ -6243,12 +6464,13 @@ def create_request_form():
             INSERT INTO purchase_requests (request_no, requested_by, department_project, request_date, required_date, category, justification, priority, estimated_amount, vendor_preference, status, source_type, attachments_json, notes, approval_history_json, next_role, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Draft', 'Manual', ?, '', '[]', NULL, ?, ?)
             """,
-            (req_no, user()["id"], dept, req_date.isoformat(), req_required.isoformat(), cat, justification, priority, estimated, vendor_pref, json_dump([path] if path else []), now_iso(), now_iso()),
+            (req_no, user()["id"], dept, req_date.isoformat(), req_required.isoformat(), cat, justification, priority, estimated, vendor_pref_full, json_dump([path] if path else []), now_iso(), now_iso()),
         )
         for item, qty, unit, total, icat in items:
             if item.strip():
                 _save_custom_value("category", icat)
-                run_query("INSERT INTO purchase_request_items (request_id, item_name, description, quantity, unit_price, total, category, suggested_vendor, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", (req_id, item.strip(), item.strip(), qty, unit, total, icat, vendor_pref, now_iso()))
+                run_query("INSERT INTO purchase_request_items (request_id, item_name, description, quantity, unit_price, total, category, suggested_vendor, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", (req_id, item.strip(), item.strip(), qty, unit, total, icat, vendor_pref_full, now_iso()))
+        _save_suggested_vendors_for_request(req_id, vendor_details, cat, "Procurement Manager draft")
         add_workflow_event("Purchase Request", req_id, "Draft Created", "Draft", req_no, user()["id"])
         log_audit("DRAFT_CREATED", "Purchase Request", req_id, {"request_no": req_no, "amount": estimated, "department": dept}, user()["id"], user()["role"], after_values={"status": "Draft"})
         _clear_line_state("req_line_rows_cmd", "req_cmd_")
@@ -6274,12 +6496,15 @@ def create_fm_draft_form():
     vendor_pref = c5.text_input("Vendor preference", key="uf_vendor_pref_cmd")
     justification = st.text_area("Business justification", key="uf_justification_cmd")
     attachment = st.file_uploader("Supporting document", type=["docx", "pdf", "jpg", "jpeg", "png", "xlsx"], key="uf_support_cmd")
+    vendor_details = _suggested_vendor_detail_inputs("uf_cmd", cat)
     items, estimated = _request_line_items("uf_line_rows_cmd", "uf_cmd", cat)
     st.metric("Estimated draft value", format_kpi_value(money(estimated)))
     if st.button("Create Utility / Facility Draft", type="primary", key="uf_create_draft_cmd"):
         if not justification.strip() or not any(i[0].strip() for i in items):
             st.error("Business justification and at least one item are required.")
             return
+        vendor_names = [v["name"] for v in vendor_details if v.get("name")]
+        vendor_pref_full = ", ".join(dict.fromkeys([v for v in [vendor_pref.strip(), *vendor_names] if v]))
         path, _ = save_upload(attachment, "requests")
         req_no = make_ref("UF")
         pr_id = run_insert(
@@ -6287,11 +6512,12 @@ def create_fm_draft_form():
             INSERT INTO purchase_requests (request_no, requested_by, department_project, request_date, required_date, category, justification, priority, estimated_amount, vendor_preference, status, source_type, attachments_json, notes, approval_history_json, facility_manager_user_id, assigned_procurement_manager_id, next_role, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'FM Draft', 'Utility Head / Facility Head', ?, '', '[]', ?, ?, NULL, ?, ?)
             """,
-            (req_no, user()["id"], dept, date.today().isoformat(), req_required.isoformat(), cat, justification, priority, estimated, vendor_pref, json_dump([path] if path else []), user()["id"], pm_id, now_iso(), now_iso()),
+            (req_no, user()["id"], dept, date.today().isoformat(), req_required.isoformat(), cat, justification, priority, estimated, vendor_pref_full, json_dump([path] if path else []), user()["id"], pm_id, now_iso(), now_iso()),
         )
         for item, qty, unit, total, icat in items:
             if item.strip():
-                run_query("INSERT INTO purchase_request_items (request_id, item_name, description, quantity, unit_price, total, category, suggested_vendor, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", (pr_id, item.strip(), item.strip(), qty, unit, total, icat, vendor_pref, now_iso()))
+                run_query("INSERT INTO purchase_request_items (request_id, item_name, description, quantity, unit_price, total, category, suggested_vendor, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", (pr_id, item.strip(), item.strip(), qty, unit, total, icat, vendor_pref_full, now_iso()))
+        _save_suggested_vendors_for_request(pr_id, vendor_details, cat, "Utility / Facility draft")
         ensure_thread("Purchase Request", pr_id, user()["id"], pm_id)
         add_workflow_event("Purchase Request", pr_id, "Draft Created", "FM Draft", req_no, user()["id"])
         log_audit("DRAFT_CREATED", "Purchase Request", pr_id, {"request_no": req_no, "amount": estimated, "department": dept}, user()["id"], user()["role"], after_values={"status": "FM Draft"})
@@ -6422,12 +6648,16 @@ def facility_manager_inbox():
     if int(pr.get("facility_manager_user_id") or 0):
         render_private_thread("Purchase Request", pr_id, int(pr["facility_manager_user_id"]), int(user()["id"]), f"pm_uf_thread_{pr_id}")
     note = st.text_area("Procurement review comment / correction reason", key=f"pm_uf_note_{pr_id}")
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
     if c1.button("Mark Reviewed", key=f"pm_uf_review_{pr_id}"):
         update_request_status(pr_id, "Reviewed by Procurement", "Reviewed by Procurement", note or "Reviewed by Procurement Manager")
-    if c2.button("Return for Correction", key=f"pm_uf_return_{pr_id}"):
+    if c2.button("Requires Sourcing", key=f"pm_uf_sourcing_{pr_id}"):
+        create_sourcing_for_request(pr_id)
+        st.session_state["procurement_section"] = "Sourcing"
+        _rerun_success("Sourcing task is ready. Add vendor quotes from the Sourcing tab.")
+    if c3.button("Return for Correction", key=f"pm_uf_return_{pr_id}"):
         update_request_status(pr_id, "Returned for Correction", "Returned for Correction", note or "Returned for correction")
-    if c3.button("Submit to Approver/Admin", type="primary", key=f"pm_uf_to_approver_{pr_id}"):
+    if c4.button("Submit to Approver/Admin", type="primary", key=f"pm_uf_to_approver_{pr_id}"):
         run_query("UPDATE purchase_requests SET next_role='approver' WHERE id=?", (pr_id,))
         create_notification(None, "Approver", "Request submitted for approval", f"{pr['request_no']} requires final approval.", "Purchase Request", pr_id, "High", ["in_app", "browser_push"], action_label="Open Pending Approvals")
         create_notification(None, "Admin", "Request submitted for approval", f"{pr['request_no']} requires approval/oversight.", "Purchase Request", pr_id, "Important", ["in_app"])
@@ -6438,27 +6668,67 @@ def request_actions(pr_id: int, pr, key_scope: str | None = None):
     scope = key_scope or "default"
     prefix = f"{scope}_pr_{pr_id}"
     role = _current_role()
-    status = pr["status"]
+    status = str(pr["status"])
+    requester_id = int(pr.get("requested_by") or 0)
+    is_pm_self_draft = role == "Procurement Manager" and status == "Draft" and requester_id == int(user()["id"])
     st.markdown("#### Guided next action")
-    actions = []
-    if status in ["Draft", "FM Draft", "Returned for Correction", "Returned to Facility Manager"] and role in ["Facility Manager", "Procurement Manager", "Admin"]:
-        actions.append(("Send to Procurement Manager", "Sent for Procurement Review", "Sent for Procurement Review", "Sent for procurement review"))
-    if status in ["Sent for Procurement Review", "Submitted to Procurement Manager", "Submitted", "Procurement Review", "Reviewed by Procurement"] and role in ["Procurement Manager", "Admin"]:
+    st.caption("Only valid actions for this request, its current status, and your role are shown.")
+
+    actions: list[tuple[str, str, str, str]] = []
+
+    # Facility/Utility drafts are sent to Procurement Manager. A Procurement
+    # Manager's own draft must not be sent back to himself; it can be sourced or
+    # submitted directly to Approver/Admin.
+    if status in ["Draft", "FM Draft", "Returned for Correction", "Returned to Facility Manager"]:
+        if is_pm_self_draft:
+            actions.extend([
+                ("Mark Requires Sourcing / Start Vendor Quotes", "__sourcing__", "Sourcing Required", "Supplier comparison required before final approval"),
+                ("Submit to Approver/Admin", "Submitted for Approval", "Submitted for Approval", "Submitted directly by Procurement Manager for final approval"),
+            ])
+        elif role in ["Facility Manager", "Admin"]:
+            actions.append(("Send to Procurement Manager", "Sent for Procurement Review", "Sent for Procurement Review", "Sent for procurement review"))
+        elif role == "Procurement Manager":
+            # Covers imported/manual drafts owned by others that landed in PM's register.
+            actions.extend([
+                ("Mark Reviewed", "Reviewed by Procurement", "Reviewed by Procurement", "Reviewed by Procurement Manager"),
+                ("Mark Requires Sourcing / Start Vendor Quotes", "__sourcing__", "Sourcing Required", "Supplier comparison required before final approval"),
+                ("Submit to Approver/Admin", "Submitted for Approval", "Submitted for Approval", "Submitted by Procurement Manager for final approval"),
+            ])
+
+    procurement_review_statuses = ["Sent for Procurement Review", "Submitted to Procurement Manager", "Submitted", "Procurement Review", "Reviewed by Procurement"]
+    if status in procurement_review_statuses and role in ["Procurement Manager", "Admin"]:
+        if status != "Reviewed by Procurement":
+            actions.append(("Mark Reviewed", "Reviewed by Procurement", "Reviewed by Procurement", "Reviewed by Procurement Manager"))
         actions.extend([
+            ("Mark Requires Sourcing / Start Vendor Quotes", "__sourcing__", "Sourcing Required", "Supplier comparison required before final approval"),
+            ("Submit to Approver/Admin", "Submitted for Approval", "Submitted for Approval", "Submitted by Procurement Manager for final approval"),
             ("Return for Correction", "Returned for Correction", "Returned for Correction", "Returned for correction"),
-            ("Submit to Approver/Admin", "Submitted for Approval", "Submitted for Approval", "Submitted for final approval"),
         ])
+
+    if status in ["Requires Sourcing", "Vendor Quote Collection"] and role in ["Procurement Manager", "Admin"]:
+        actions.append(("Open / Continue Sourcing", "__open_sourcing__", "Sourcing Continued", "Continue vendor quote collection"))
+
+    if status == "Vendor Recommendation" and role in ["Procurement Manager", "Admin"]:
+        actions.extend([
+            ("Submit Vendor Recommendation to Approver/Admin", "Submitted for Approval", "Submitted for Approval", "Vendor recommendation submitted for final approval"),
+            ("Open / Continue Sourcing", "__open_sourcing__", "Sourcing Continued", "Continue vendor quote collection"),
+            ("Return for Correction", "Returned for Correction", "Returned for Correction", "Returned for correction"),
+        ])
+
     if status in ["Submitted for Approval", "Pending Approver/MD Approval", "Pending Approval"] and can_approve(role):
         actions.extend([
             ("Approve Request", "Approved", "Approved", "Approved"),
             ("Reject Request", "Rejected", "Rejected", "Rejected"),
             ("Return for Correction", "Returned for Correction", "Returned for Correction", "Returned for correction"),
         ])
+
     if role == "Finance" and status in ["Approved", "Awaiting Payment", "Approved for Payment"]:
         st.info("This item is approved. Use Finance → Approved for Payment to record payment and upload receipt.")
+
     if not actions:
         st.info("No direct action is available for this request at its current status or your role.")
         return
+
     chosen = st.selectbox("Choose next action", [a[0] for a in actions], key=f"guided_action_cmd_{prefix}")
     reason = st.text_area("Comment / reason", key=f"reason_cmd_{prefix}")
     if st.button("Apply selected action", type="primary", key=f"apply_action_cmd_{prefix}"):
@@ -6466,42 +6736,139 @@ def request_actions(pr_id: int, pr, key_scope: str | None = None):
         if any(word in label for word in ["Reject", "Return"]) and not reason.strip():
             st.error("Please enter a reason.")
             return
+        if new_status in ["__sourcing__", "__open_sourcing__"]:
+            sid = create_sourcing_for_request(pr_id)
+            st.session_state["procurement_section"] = "Sourcing"
+            _rerun_success("Sourcing task is ready. Add vendor quotes from the Sourcing tab.")
+            return
         if new_status in ["Approved", "Rejected"]:
             approval_action("Purchase Request", pr_id, status, new_status, event, reason or note)
-        else:
-            if new_status == "Submitted for Approval":
-                create_notification(None, "Approver", "Request pending approval", f"{pr['request_no']} requires final approval.", "Purchase Request", pr_id, "High", ["in_app", "browser_push"], action_label="Open Pending Approvals")
-            update_request_status(pr_id, new_status, event, reason or note)
-
+            return
+        if new_status == "Submitted for Approval":
+            create_notification(None, "Approver", "Request pending approval", f"{pr['request_no']} requires final approval.", "Purchase Request", pr_id, "High", ["in_app", "browser_push"], action_label="Open Pending Approvals")
+            create_notification(None, "Admin", "Request submitted for approval", f"{pr['request_no']} requires approval/oversight.", "Purchase Request", pr_id, "Important", ["in_app"])
+        update_request_status(pr_id, new_status, event, reason or note)
 
 def request_next_action_board():
-    st.caption("Queue KPIs reduce as items move forward; cumulative KPIs remain available in dashboards/reports.")
-    cards = [
-        ("Procurement review queue", ("Sent for Procurement Review", "Submitted to Procurement Manager", "Submitted"), "Open Utility Head / Facility Head Inbox"),
-        ("Final approval queue", ("Submitted for Approval", "Pending Approver/MD Approval", "Pending Approval"), "Open Pending Approvals"),
-        ("Finance payment queue", ("Approved", "Awaiting Payment", "Approved for Payment"), "Open Approved for Payment"),
+    st.caption("Use this board for Procurement Manager command actions: review, sourcing, vendor recommendation, approval submission and PO handoff.")
+    role = _current_role()
+    review_statuses = ("Sent for Procurement Review", "Submitted to Procurement Manager", "Submitted", "Procurement Review")
+    cards: list[dict[str, Any]] = [
+        {
+            "title": "My PM drafts: submit directly to Approver/Admin",
+            "statuses": ("Draft",),
+            "button": "Submit to Approver/Admin",
+            "new_status": "Submitted for Approval",
+            "event": "Submitted for Approval",
+            "note": "Submitted directly by Procurement Manager for final approval",
+            "extra_sql": " AND requested_by=?",
+            "extra_params": (user()["id"],),
+        },
+        {
+            "title": "Facility submissions: mark reviewed",
+            "statuses": review_statuses,
+            "button": "Mark Reviewed",
+            "new_status": "Reviewed by Procurement",
+            "event": "Reviewed by Procurement",
+            "note": "Reviewed by Procurement Manager",
+            "extra_sql": "",
+            "extra_params": (),
+        },
+        {
+            "title": "Requests requiring sourcing / vendor quotes",
+            "statuses": (*review_statuses, "Reviewed by Procurement"),
+            "button": "Create / Open Sourcing Task",
+            "new_status": "__sourcing__",
+            "event": "Sourcing Required",
+            "note": "Supplier comparison required before final approval",
+            "extra_sql": "",
+            "extra_params": (),
+        },
+        {
+            "title": "Active sourcing: continue vendor quote collection",
+            "statuses": ("Requires Sourcing", "Vendor Quote Collection"),
+            "button": "Open Sourcing Tab",
+            "new_status": "__open_sourcing__",
+            "event": "Sourcing Continued",
+            "note": "Continue vendor quote collection",
+            "extra_sql": "",
+            "extra_params": (),
+        },
+        {
+            "title": "Vendor recommendations ready for Approver/Admin",
+            "statuses": ("Vendor Recommendation",),
+            "button": "Submit Recommendation to Approver/Admin",
+            "new_status": "Submitted for Approval",
+            "event": "Submitted for Approval",
+            "note": "Vendor recommendation submitted for final approval",
+            "extra_sql": "",
+            "extra_params": (),
+        },
+        {
+            "title": "Approved requests needing PO",
+            "statuses": ("Approved",),
+            "button": "Open PO Creation",
+            "new_status": "__open_po__",
+            "event": "PO Action",
+            "note": "Create purchase order for approved request",
+            "extra_sql": " AND linked_po_id IS NULL",
+            "extra_params": (),
+        },
     ]
-    selected_action = st.selectbox("Queue", [c[0] for c in cards], key="pr_action_board_choice_cmd")
-    title, statuses, action = [c for c in cards if c[0] == selected_action][0]
+    if role not in ["Procurement Manager", "Admin"]:
+        st.info("This command board is mainly for Procurement Manager actions.")
+    selected_title = st.selectbox("Action board", [c["title"] for c in cards], key="pr_action_board_choice_cmd")
+    card = [c for c in cards if c["title"] == selected_title][0]
+    statuses = tuple(card["statuses"])
     placeholders = ",".join(["?"] * len(statuses))
-    df = df_query(f"SELECT id, request_no, department_project, category, estimated_amount, status, updated_at FROM purchase_requests WHERE status IN ({placeholders}) ORDER BY updated_at DESC", statuses)
+    params: list[Any] = list(statuses) + list(card.get("extra_params", ()))
+    df = df_query(
+        f"""
+        SELECT id, request_no, department_project, category, estimated_amount, status, updated_at
+        FROM purchase_requests
+        WHERE status IN ({placeholders}) {card.get('extra_sql', '')}
+        ORDER BY updated_at DESC, created_at DESC
+        """,
+        params,
+    )
     if df.empty:
-        st.success(f"No request currently in {title.lower()}.")
+        st.success(f"No request currently needs: {selected_title.lower()}.")
         return
-    show = df.copy(); show["estimated_amount"] = show["estimated_amount"].apply(money); dataframe(show.drop(columns=["id"]))
-    st.info(action)
-
+    show = df.copy()
+    show["estimated_amount"] = show["estimated_amount"].apply(money)
+    dataframe(show.drop(columns=["id"]))
+    selected = st.selectbox("Select request", [f"{r.request_no} — {r.status} — {money(r.estimated_amount)} — #{int(r.id)}" for r in df.itertuples()], key="pr_action_board_request_cmd")
+    pr_id = int(selected.rsplit("#", 1)[1])
+    note = st.text_area("Comment / note", value=card["note"], key="pr_action_board_note_cmd")
+    if st.button(card["button"], type="primary", key="pr_apply_guided_action_cmd"):
+        new_status = card["new_status"]
+        if new_status in ["__sourcing__", "__open_sourcing__"]:
+            create_sourcing_for_request(pr_id)
+            st.session_state["procurement_section"] = "Sourcing"
+            _rerun_success("Sourcing task is ready. Add vendor quotes from the Sourcing tab.")
+            return
+        if new_status == "__open_po__":
+            st.session_state["procurement_section"] = "Purchase Orders"
+            st.rerun()
+            return
+        if new_status == "Submitted for Approval":
+            pr_no = str(df[df["id"] == pr_id].iloc[0]["request_no"])
+            create_notification(None, "Approver", "Request pending approval", f"{pr_no} requires final approval.", "Purchase Request", pr_id, "High", ["in_app", "browser_push"], action_label="Open Pending Approvals")
+            create_notification(None, "Admin", "Request submitted for approval", f"{pr_no} requires approval/oversight.", "Purchase Request", pr_id, "Important", ["in_app"])
+        update_request_status(pr_id, new_status, card["event"], note or card["note"])
 
 def procurement_dashboard():
     st.subheader("What needs my attention?")
     queue_review = int(df_query("SELECT COUNT(*) c FROM purchase_requests WHERE next_role='procurement_manager' OR status IN ('Sent for Procurement Review','Submitted to Procurement Manager','Submitted')").iloc[0, 0])
-    submitted_total = int(df_query("SELECT COUNT(*) c FROM purchase_requests WHERE status NOT IN ('Draft','FM Draft')").iloc[0, 0])
+    sourcing_count = int(df_query("SELECT COUNT(*) c FROM purchase_requests WHERE status IN ('Requires Sourcing','Vendor Quote Collection')").iloc[0, 0])
+    recommendation_count = int(df_query("SELECT COUNT(*) c FROM purchase_requests WHERE status='Vendor Recommendation'").iloc[0, 0])
     approved_total = int(df_query("SELECT COUNT(*) c FROM purchase_requests WHERE status IN ('Approved','Awaiting Payment','Approved for Payment','Paid','Completed','Closed')").iloc[0, 0])
     metric_row([
         ("Pending Review", queue_review, "queue"),
-        ("Total Submitted", submitted_total, "cumulative"),
+        ("Needs Sourcing", sourcing_count, "supplier comparison queue"),
+        ("Vendor Recommendations", recommendation_count, "ready to submit to Approver/Admin"),
         ("Total Approved", approved_total, "cumulative"),
-    ], cols=3)
+    ], cols=4)
     df = df_query("SELECT request_no, department_project, category, estimated_amount, status, updated_at FROM purchase_requests WHERE status NOT IN ('Rejected','Archived') ORDER BY updated_at DESC LIMIT 25")
     if not df.empty:
         df["estimated_amount"] = df["estimated_amount"].apply(money); dataframe(df)
@@ -6672,6 +7039,17 @@ def create_gateway_pass_form():
         driver_phone = c10.text_input("Driver phone", key="gp_create_driver_phone_cmd")
         receiver = c11.text_input("Receiver name", key="gp_create_receiver_cmd")
         receiver_org = st.text_input("Receiver organization", key="gp_create_receiver_org_cmd")
+        return_tab, security_tab = st.tabs(["Return Date", "Security Verification"])
+        with return_tab:
+            actual_return_applies = st.checkbox("Actual return date available", value=False, key="gp_create_actual_return_applies_cmd")
+            actual_return = st.date_input("Actual return date", date.today(), key="gp_create_actual_return_cmd", disabled=not actual_return_applies)
+        with security_tab:
+            s1, s2 = st.columns(2)
+            security_officer = s1.text_input("Security Officer Name", key="gp_create_security_officer_cmd")
+            gate_time = s2.text_input("Gate Verification Time", key="gp_create_gate_time_cmd", placeholder="e.g. 04:30 PM")
+            s3, s4 = st.columns(2)
+            exit_entry = s3.text_input("Exit / Entry Confirmation", key="gp_create_exit_entry_cmd", placeholder="e.g. Exit confirmed")
+            security_signature = s4.text_input("Security Signature / Name", key="gp_create_security_signature_cmd")
         items = []
         st.markdown("##### Item details")
         for idx, row_id in enumerate(rows, 1):
@@ -6707,10 +7085,10 @@ def create_gateway_pass_form():
         pass_no = make_ref("GP")
         gp_id = run_insert(
             """
-            INSERT INTO gateway_passes (pass_number, facility_manager_user_id, department, movement_type, purpose, origin_location, destination, expected_movement_date, expected_return_date, vehicle_number, driver_name, driver_phone, receiver_name, receiver_organization, security_checkpoint, status, next_role, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Draft', NULL, ?, ?)
+            INSERT INTO gateway_passes (pass_number, facility_manager_user_id, department, movement_type, purpose, origin_location, destination, expected_movement_date, expected_return_date, actual_return_date, vehicle_number, driver_name, driver_phone, receiver_name, receiver_organization, security_checkpoint, security_officer_name, gate_verification_time, exit_entry_confirmation, security_signature, status, next_role, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Draft', NULL, ?, ?)
             """,
-            (pass_no, user()["id"], dept, movement_type, purpose.strip(), origin, destination, expected_movement.isoformat(), expected_return.isoformat() if expected_return else None, vehicle, driver, driver_phone, receiver, receiver_org, checkpoint, now_iso(), now_iso()),
+            (pass_no, user()["id"], dept, movement_type, purpose.strip(), origin, destination, expected_movement.isoformat(), expected_return.isoformat() if expected_return else None, actual_return.isoformat() if actual_return_applies else None, vehicle, driver, driver_phone, receiver, receiver_org, checkpoint, security_officer.strip() or None, gate_time.strip() or None, exit_entry.strip() or None, security_signature.strip() or None, now_iso(), now_iso()),
         )
         for item in valid_items:
             run_query(
@@ -6866,9 +7244,23 @@ def edit_gateway_pass_form(gateway_pass_id: int):
         vehicle = c6.text_input("Vehicle number", value=row["vehicle_number"] or "", key=f"edit_gp_vehicle_cmd_{gateway_pass_id}")
         driver = c7.text_input("Driver name", value=row["driver_name"] or "", key=f"edit_gp_driver_cmd_{gateway_pass_id}")
         driver_phone = c8.text_input("Driver phone", value=row["driver_phone"] or "", key=f"edit_gp_phone_cmd_{gateway_pass_id}")
-        c9, c10 = st.columns(2)
+        c9, c10, c11 = st.columns(3)
         receiver = c9.text_input("Receiver name", value=row["receiver_name"] or "", key=f"edit_gp_receiver_cmd_{gateway_pass_id}")
-        checkpoint = c10.text_input("Security checkpoint", value=row["security_checkpoint"] or "", key=f"edit_gp_check_cmd_{gateway_pass_id}")
+        receiver_org = c10.text_input("Receiver organization", value=_series_value(row, "receiver_organization"), key=f"edit_gp_receiver_org_cmd_{gateway_pass_id}")
+        checkpoint = c11.text_input("Security checkpoint", value=row["security_checkpoint"] or "", key=f"edit_gp_check_cmd_{gateway_pass_id}")
+        return_tab, security_tab = st.tabs(["Return Date", "Security Verification"])
+        with return_tab:
+            return_required = st.checkbox("Return date applies", value=bool(_series_value(row, "expected_return_date")), key=f"edit_gp_return_applies_cmd_{gateway_pass_id}")
+            expected_return = st.date_input("Return date", value=_date_or_default(row.get("expected_return_date"), date.today() + timedelta(days=1)), key=f"edit_gp_return_date_cmd_{gateway_pass_id}", disabled=not return_required)
+            actual_return_applies = st.checkbox("Actual return date available", value=bool(_series_value(row, "actual_return_date")), key=f"edit_gp_actual_return_applies_cmd_{gateway_pass_id}")
+            actual_return = st.date_input("Actual return date", value=_date_or_default(row.get("actual_return_date"), date.today()), key=f"edit_gp_actual_return_date_cmd_{gateway_pass_id}", disabled=not actual_return_applies)
+        with security_tab:
+            s1, s2 = st.columns(2)
+            security_officer = s1.text_input("Security Officer Name", value=_series_value(row, "security_officer_name"), key=f"edit_gp_security_officer_cmd_{gateway_pass_id}")
+            gate_time = s2.text_input("Gate Verification Time", value=_series_value(row, "gate_verification_time"), placeholder="e.g. 04:30 PM", key=f"edit_gp_gate_time_cmd_{gateway_pass_id}")
+            s3, s4 = st.columns(2)
+            exit_entry = s3.text_input("Exit / Entry Confirmation", value=_series_value(row, "exit_entry_confirmation"), placeholder="e.g. Exit confirmed", key=f"edit_gp_exit_entry_cmd_{gateway_pass_id}")
+            security_signature = s4.text_input("Security Signature / Name", value=_series_value(row, "security_signature"), key=f"edit_gp_security_signature_cmd_{gateway_pass_id}")
         submitted = st.form_submit_button("Save Gateway Pass Details")
     if submitted:
         run_query("UPDATE gateway_passes SET department=?, movement_type=?, purpose=?, origin_location=?, destination=?, expected_movement_date=?, vehicle_number=?, driver_name=?, driver_phone=?, receiver_name=?, security_checkpoint=?, updated_at=? WHERE id=?", (dept, movement_type, purpose, origin, destination, expected_movement.isoformat(), vehicle, driver, driver_phone, receiver, checkpoint, now_iso(), gateway_pass_id))
@@ -6980,6 +7372,8 @@ def generate_gateway_pass_document(gateway_pass_id: int) -> str | None:
             [Paragraph("<b>Department:</b>", normal), Paragraph(_ptext(row.get("department")), normal)],
             [Paragraph("<b>Movement Type:</b>", normal), Paragraph(_ptext(row.get("movement_type")), normal)],
             [Paragraph("<b>Movement Date:</b>", normal), Paragraph(_fmt_clean_date(row.get("expected_movement_date")), normal)],
+            [Paragraph("<b>Return Date:</b>", normal), Paragraph(_fmt_clean_date(row.get("expected_return_date")), normal)],
+            [Paragraph("<b>Actual Return Date:</b>", normal), Paragraph(_fmt_clean_date(row.get("actual_return_date")), normal)],
             [Paragraph("<b>Origin:</b>", normal), Paragraph(_ptext(row.get("origin_location"), "N/A"), normal)],
             [Paragraph("<b>Destination:</b>", normal), Paragraph(_ptext(row.get("destination"), "N/A"), normal)],
         ], colWidths=[33*mm, 145*mm])
@@ -7055,8 +7449,8 @@ def generate_gateway_pass_document(gateway_pass_id: int) -> str | None:
 
         story.append(Paragraph("SECURITY VERIFICATION", section_style))
         security = [
-            [Paragraph("Security Officer Name:", normal), Paragraph("", normal), Paragraph("Gate Verification Time:", normal), Paragraph("", normal)],
-            [Paragraph("Exit / Entry Confirmation:", normal), Paragraph("", normal), Paragraph("Security Signature:", normal), Paragraph("", normal)],
+            [Paragraph("Security Officer Name:", normal), Paragraph(_ptext(row.get("security_officer_name")), normal), Paragraph("Gate Verification Time:", normal), Paragraph(_ptext(row.get("gate_verification_time")), normal)],
+            [Paragraph("Exit / Entry Confirmation:", normal), Paragraph(_ptext(row.get("exit_entry_confirmation")), normal), Paragraph("Security Signature:", normal), Paragraph(_ptext(row.get("security_signature")), normal)],
         ]
         story.append(Table(security, colWidths=[42*mm, 46*mm, 44*mm, 46*mm], style=line_style))
         story.append(Spacer(1, 7))
@@ -7085,6 +7479,8 @@ def gateway_pass_register(where_sql: str, params: tuple | list, title: str, allo
     gateway_pass_detail(gp_id)
     if _is_utility() and row["status"] in ["Draft", "Returned for Correction"]:
         edit_gateway_pass_form(gp_id)
+    if _is_utility() and row["status"] in ["Approved", "Generated", "Downloaded", "Completed"]:
+        gateway_pass_return_security_form(gp_id, key_prefix=f"{key_prefix}_return_security")
     events = df_query("SELECT event, status, note, user_id, created_at FROM gateway_pass_events WHERE gateway_pass_id=? ORDER BY created_at DESC", (gp_id,))
     with st.expander("Gateway pass history", expanded=False):
         dataframe(events) if not events.empty else st.info("No events yet.")
