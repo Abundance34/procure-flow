@@ -204,15 +204,22 @@ def _session_cookie_password() -> str:
 
 
 def initialize_browser_session_storage() -> bool:
-    """Create the encrypted cookie bridge before authentication is checked.
+    """Initialize the optional encrypted browser-cookie bridge safely.
 
-    Streamlit resets ``st.session_state`` after a full browser refresh. This
-    bridge stores only the opaque, DB-backed session token in an encrypted
-    browser cookie, allowing the same valid user session and current URL
-    section hint to be restored without returning the user to the login page.
+    The cookie component can take an extra frontend cycle to become ready on
+    Streamlit Community Cloud.  The earlier implementation called ``st.stop``
+    while waiting, which could leave the entire application as a blank page if
+    that component failed to finish loading.  ProcureFlow must always render
+    its normal login/application view even when browser-cookie restoration is
+    temporarily unavailable.
+
+    A server-side session is still the authority.  The cookie contains only an
+    opaque token and is used solely to restore a valid session after refresh.
     """
     if EncryptedCookieManager is None:
-        return True
+        st.session_state["_pf_cookie_bridge_ready"] = False
+        return False
+
     manager = st.session_state.get(SESSION_COOKIE_MANAGER_KEY)
     if manager is None:
         try:
@@ -222,16 +229,23 @@ def initialize_browser_session_storage() -> bool:
             )
             st.session_state[SESSION_COOKIE_MANAGER_KEY] = manager
         except Exception:
-            return True
+            st.session_state["_pf_cookie_bridge_ready"] = False
+            return False
+
     try:
-        if not manager.ready():
-            # Cookie components finish loading on the next frontend cycle.
-            # Stopping here avoids displaying a transient login screen before
-            # the existing browser session can be restored.
-            st.stop()
+        ready = bool(manager.ready())
     except Exception:
-        return True
-    return True
+        ready = False
+    st.session_state["_pf_cookie_bridge_ready"] = ready
+
+    # Never block the whole Streamlit page while a third-party component is
+    # loading.  When it becomes ready on a later rerun, persist any session
+    # token that was created before the browser bridge was available.
+    if ready:
+        pending_token = st.session_state.pop("pf_pending_browser_session_token", None)
+        if pending_token:
+            _store_browser_session_token(str(pending_token))
+    return ready
 
 
 def _browser_cookie_manager():
@@ -240,7 +254,7 @@ def _browser_cookie_manager():
 
 def _browser_session_token() -> str | None:
     manager = _browser_cookie_manager()
-    if manager is None:
+    if manager is None or not st.session_state.get("_pf_cookie_bridge_ready", False):
         return None
     try:
         token = manager.get(SESSION_COOKIE_NAME)
@@ -251,15 +265,22 @@ def _browser_session_token() -> str | None:
 
 def _store_browser_session_token(token: str) -> None:
     manager = _browser_cookie_manager()
-    if manager is None or not token:
+    if not token:
+        return
+    if manager is None or not st.session_state.get("_pf_cookie_bridge_ready", False):
+        # Preserve the opaque token in memory until the optional component is
+        # ready.  This avoids losing refresh persistence after a quick login
+        # while also avoiding a blank app page during component startup.
+        st.session_state["pf_pending_browser_session_token"] = str(token)
         return
     try:
         manager[SESSION_COOKIE_NAME] = str(token)
         manager.save()
+        st.session_state.pop("pf_pending_browser_session_token", None)
     except Exception:
         # The server-side session remains valid; this only means a full
         # browser refresh will require a new login on this browser.
-        pass
+        st.session_state["pf_pending_browser_session_token"] = str(token)
 
 
 def _clear_browser_session_token() -> None:
