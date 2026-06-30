@@ -12,6 +12,43 @@ from typing import Optional
 from core.permissions import can_approve, can_pay, can_review_procurement
 
 
+# Monetary approval authority. Procurement Manager has delegated-by-policy
+# authority for low-value transactions only; higher values remain with the
+# Approver / MD. The value is deliberately central so request, PO and payment
+# screens cannot drift into different threshold rules.
+PROCUREMENT_MANAGER_APPROVAL_THRESHOLD = 100_000.0
+LOW_VALUE_APPROVAL_MODE = "Low-Value Approval — Procurement Manager (≤ ₦100,000)"
+
+
+def approval_amount(value: object | None) -> float:
+    """Return a safe monetary amount for threshold routing.
+
+    UI values and legacy SQLite rows may be ``None`` or text; invalid values
+    become zero rather than breaking a workflow screen.
+    """
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def is_low_value_approval(value: object | None) -> bool:
+    """True when a transaction is within the PM approval limit.
+
+    The policy treats exactly ₦100,000 as low value so there is no un-routed
+    gap at the boundary.
+    """
+    return approval_amount(value) <= PROCUREMENT_MANAGER_APPROVAL_THRESHOLD
+
+
+def required_approval_role_for_amount(value: object | None) -> str:
+    """Return the role queue that owns an approval for this amount.
+
+    Uses the database role key rather than a display label.
+    """
+    return "procurement_manager" if is_low_value_approval(value) else "approver"
+
+
 STATUS_DRAFT = "Draft"
 STATUS_SENT_REVIEW = "Sent for Procurement Review"
 STATUS_RETURNED = "Returned for Correction"
@@ -142,11 +179,21 @@ def payment_status_for_request_status(status: str | None) -> Optional[str]:
     return None
 
 
-def request_routing_for_status(status: str | None) -> WorkflowRouting:
+def request_routing_for_status(status: str | None, amount: object | None = None) -> WorkflowRouting:
+    """Return the canonical request routing for a status and optional amount.
+
+    Purchase requests sent for final approval are value-routed centrally: the
+    Procurement Manager owns amounts up to and including ₦100,000, while the
+    Approver / MD owns higher values.  Callers that do not provide an amount
+    retain the legacy/default final-approval route for backward compatibility.
+    """
     canonical = normalize_status(status)
+    next_role = next_role_for_status(canonical)
+    if canonical == STATUS_SUBMITTED_APPROVAL and amount is not None:
+        next_role = required_approval_role_for_amount(amount)
     return WorkflowRouting(
         canonical_status=canonical,
-        next_role=next_role_for_status(canonical),
+        next_role=next_role,
         payment_status=payment_status_for_request_status(canonical),
     )
 
@@ -186,3 +233,39 @@ def canonical_status(status: str | None) -> str:
 
 def workflow_next_role(status: str | None) -> Optional[str]:
     return next_role_for_status(status)
+
+
+# Purchase-order fulfilment routing. Procurement owns commercial PO work up to
+# release; Logistics owns delivery coordination and receiving afterwards.
+PO_STATUS_DRAFT = "Draft"
+PO_STATUS_PENDING_APPROVAL = "Pending Approval"
+PO_STATUS_APPROVED = "Approved"
+PO_STATUS_RELEASED_TO_LOGISTICS = "Released to Logistics"
+PO_STATUS_SCHEDULED = "Scheduled"
+PO_STATUS_DISPATCHED = "Dispatched"
+PO_STATUS_IN_TRANSIT = "In Transit"
+PO_STATUS_DELAYED = "Delayed"
+PO_STATUS_ARRIVED = "Arrived"
+PO_STATUS_PARTIALLY_RECEIVED = "Partially Received"
+PO_STATUS_FULLY_RECEIVED = "Fully Received"
+PO_STATUS_DISPUTED = "Disputed"
+PO_STATUS_RETURNED = "Returned"
+
+PO_NEXT_ROLE_BY_STATUS = {
+    PO_STATUS_DRAFT: "procurement_manager",
+    PO_STATUS_PENDING_APPROVAL: "approver",
+    PO_STATUS_APPROVED: "procurement_manager",
+    PO_STATUS_RELEASED_TO_LOGISTICS: "logistics_officer",
+    PO_STATUS_SCHEDULED: "logistics_officer",
+    PO_STATUS_DISPATCHED: "logistics_officer",
+    PO_STATUS_IN_TRANSIT: "logistics_officer",
+    PO_STATUS_DELAYED: "logistics_officer",
+    PO_STATUS_ARRIVED: "logistics_officer",
+    PO_STATUS_PARTIALLY_RECEIVED: "logistics_officer",
+    PO_STATUS_FULLY_RECEIVED: "finance",
+    PO_STATUS_DISPUTED: "procurement_manager",
+    PO_STATUS_RETURNED: "procurement_manager",
+}
+
+def po_next_role_for_status(status: str | None) -> Optional[str]:
+    return PO_NEXT_ROLE_BY_STATUS.get(status or "")

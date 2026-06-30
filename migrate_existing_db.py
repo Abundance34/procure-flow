@@ -9,10 +9,11 @@ routing fields such as next_role.
 """
 from __future__ import annotations
 
-from core.db import init_db, ensure_command_chain_schema, DB_PATH
+from core.db import init_db, ensure_command_chain_schema, ensure_logistics_schema, DB_PATH
 
 
 if __name__ == "__main__":
     init_db()
+    ensure_logistics_schema()
     ensure_command_chain_schema()
     print(f"Migration complete: {DB_PATH}")

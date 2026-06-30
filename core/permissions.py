@@ -8,6 +8,7 @@ from __future__ import annotations
 from typing import Mapping, Any
 
 APPROVAL_ROLES = {"Admin", "Approver"}
+LOW_VALUE_APPROVAL_ROLES = {"Admin", "Approver", "Procurement Manager"}
 PAYMENT_ROLES = {"Finance", "Admin"}
 READ_ONLY_ROLES = {"Auditor"}
 UTILITY_ROLE = "Facility Manager"  # legacy DB role name; visible label is below
@@ -15,6 +16,7 @@ UTILITY_VISIBLE_LABEL = "Utility Head / Facility Head"
 ROLE_LABELS = {
     "Facility Manager": UTILITY_VISIBLE_LABEL,
     "Approver": "Approver / MD",
+    "Logistics Officer": "Logistics Officer",
 }
 
 
@@ -24,6 +26,15 @@ def display_role(role: str | None) -> str:
 
 def can_approve(role: str | None) -> bool:
     return role in APPROVAL_ROLES
+
+
+def can_approve_low_value(role: str | None) -> bool:
+    """Return whether a role may use the low-value approval authority.
+
+    This does not make Procurement Manager a general final approver. Amount
+    validation remains in ``core.workflow`` and the UI/service layer.
+    """
+    return role in LOW_VALUE_APPROVAL_ROLES
 
 
 def can_approve_gateway_pass(role: str | None) -> bool:
@@ -87,16 +98,22 @@ def safe_role_permissions(role: str | None) -> set[str]:
             "approved_for_payment", "return_for_clarification", "create_gateway_pass", "edit_own_gateway_pass",
             "submit_gateway_pass", "review_gateway_pass", "approve_gateway_pass", "generate_gateway_pass",
             "download_gateway_pass", "audit_gateway_pass", "view_all_activity_logs", "view_notifications_monitor",
-            "manage_approval_delegation",
+            "manage_approval_delegation", "release_po_to_logistics", "manage_logistics",
+            "update_delivery_tracking", "record_delivery_exception", "coordinate_gateway_pass",
+            "upload_logistics_documents", "approve_low_value",
+            "create_payment_payee_details", "edit_own_draft_payment_payee_details",
+            "view_masked_payment_payee_details", "view_payment_payee_audit",
         }
     if role == "Approver":
         return base | {"approve_request", "reject_request", "approve_po", "approve_payment", "approve_gateway_pass", "view_reports", "review_gateway_pass"}
     if role == "Procurement Manager":
         return base | {
             "create_request", "edit_request", "edit_own_request", "submit_request", "procurement_review",
-            "create_sourcing", "manage_quotes", "recommend_vendor", "create_po", "receive_goods",
+            "create_sourcing", "manage_quotes", "recommend_vendor", "create_po", "release_po_to_logistics",
             "manage_vendor", "import_documents", "view_reports", "return_for_clarification",
             "communicate_with_procurement_manager", "review_gateway_pass", "submit_for_approval",
+            "approve_low_value", "create_payment_payee_details",
+            "edit_own_draft_payment_payee_details", "view_masked_payment_payee_details",
         }
     if role == "Facility Manager":
         return base | {
@@ -104,9 +121,19 @@ def safe_role_permissions(role: str | None) -> set[str]:
             "upload_supporting_documents", "view_own_requests", "view_own_activity_history",
             "communicate_with_procurement_manager", "create_gateway_pass", "edit_own_gateway_pass",
             "submit_gateway_pass", "generate_gateway_pass", "download_gateway_pass", "view_reports",
+            "create_payment_payee_details", "edit_own_draft_payment_payee_details",
+            "view_masked_payment_payee_details",
+        }
+    if role == "Logistics Officer":
+        # Logistics executes fulfilment after Procurement commercially releases an
+        # approved PO. It cannot source vendors, create POs, or approve anything.
+        return base | {
+            "view_logistics", "manage_logistics", "receive_goods", "update_delivery_tracking",
+            "record_delivery_exception", "coordinate_gateway_pass", "upload_logistics_documents",
+            "view_logistics_documents", "view_reports",
         }
     if role == "Finance":
-        return base | {"review_invoice", "manage_payments", "record_expense", "manage_budget", "manage_income", "view_reports", "approved_for_payment", "upload_receipt"}
+        return base | {"review_invoice", "manage_payments", "record_expense", "manage_budget", "manage_income", "view_reports", "approved_for_payment", "upload_receipt", "view_full_payment_payee_details", "verify_payment_payee_details"}
     if role == "Auditor":
-        return base | {"view_reports", "audit", "read_only_all", "audit_gateway_pass", "download_gateway_pass"}
+        return base | {"view_reports", "audit", "read_only_all", "audit_gateway_pass", "download_gateway_pass", "view_masked_payment_payee_details", "view_payment_payee_audit", "reveal_sensitive_payment_details"}
     return base

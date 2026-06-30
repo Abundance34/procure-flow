@@ -32,6 +32,47 @@ def inject_css():
     """, unsafe_allow_html=True)
 
 
+def role_header(title: str, subtitle: str) -> None:
+    """Render the shared ProcureFlow workspace header.
+
+    Kept in ``core.ui`` so role-specific modules can use the same header
+    without importing the large workspace module (which would create a
+    circular dependency).
+    """
+    inject_css()
+    st.markdown(
+        f"""
+        <div class="pf-hero">
+            <h1 style="margin:0;">{html.escape(str(title))}</h1>
+            <p>{html.escape(str(subtitle))}</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    flash = st.session_state.pop("pf_flash_success", None)
+    if flash:
+        st.success(str(flash))
+
+
+def metric_row(metrics: list[tuple[str, Any, str | None]], cols: int = 4) -> None:
+    """Render a responsive row of standard KPI metrics.
+
+    This belongs in the shared UI module because Auditor and role workspaces
+    both use it. Formatting is resolved at call time by ``format_kpi_value``.
+    """
+    if not metrics:
+        return
+    column_count = max(1, int(cols or 1))
+    columns = st.columns(column_count)
+    for index, metric in enumerate(metrics):
+        label, value, help_text = metric
+        columns[index % column_count].metric(
+            str(label),
+            format_kpi_value(value),
+            help=help_text,
+        )
+
+
 def money(value: Any) -> str:
     try:
         return f"₦{float(value):,.2f}"

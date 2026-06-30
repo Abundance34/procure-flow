@@ -2,9 +2,14 @@
 
 ProcureFlow is a Streamlit-based internal procurement, finance, audit, reporting, income, and gateway-pass management application. This build hardens the workflow so every request follows the approved chain of command:
 
-**Utility Head / Facility Head -> Procurement Manager -> Approver/Admin -> Finance -> Procurement Closure -> History/Audit**
+**Utility Head / Facility Head -> Procurement Manager -> value-based approval -> Finance -> Procurement Closure -> History/Audit**
 
-Only **Admin** and **Approver / MD** can approve or reject workflow items. Finance can only act after approval.
+The approval rule in this build is **₦100,000 inclusive**:
+
+- **₦100,000 and below:** Procurement Manager approves the request, PO, or standalone payment request.
+- **Above ₦100,000:** Approver / MD approves.
+- A **Procurement Manager-created request** always goes to Approver / MD for independent approval, even below ₦100,000, so a requester cannot approve their own request.
+- Finance can only act after the authorized approval is complete.
 
 ---
 
@@ -15,6 +20,7 @@ Only **Admin** and **Approver / MD** can approve or reject workflow items. Finan
 | Admin | `admin` | `admin123` |
 | Procurement Manager | `procurement` | `procure123` |
 | Utility Head / Facility Head | `facility` | `facility123` |
+| Logistics Officer | `logistics` | `logistics123` |
 | Finance | `finance` | `finance123` |
 | Approver / MD | `approver` | `approve123` |
 | Auditor | `auditor` | `audit123` |
@@ -31,12 +37,13 @@ Only **Admin** and **Approver / MD** can approve or reject workflow items. Finan
 - Added workflow constants/routing helpers in `core/workflow.py`.
 - Enforced the command chain:
   - Utility Head / Facility Head creates drafts and sends them for Procurement Manager review.
-  - Procurement Manager reviews, comments, returns for correction, or submits to Approver/Admin.
-  - Approver/Admin approves or rejects.
-  - Finance only sees approved items ready for payment.
+  - Procurement Manager reviews, sources, returns for correction, and approves eligible transactions at or below ₦100,000.
+  - Approver / MD approves transactions above ₦100,000 and independently approves Procurement Manager-created requests.
+  - Finance only sees authorized approved items ready for payment.
   - Auditor is read-only and sees histories, audit logs, reports, and completed records.
-- Removed unsafe approval rights from Finance and Procurement Manager.
-- Removed Procurement Manager fallback approval from the approval rule migration.
+- Procurement Manager receives a scoped `approve_low_value` authority; this does **not** grant general approval rights or gateway-pass final approval.
+- The Approver / MD receives notification and permanent approval-history/audit records for every Procurement Manager low-value approval.
+- Removed unsafe approval rights from Finance.
 - Draft deletion is restricted to own drafts before submission, except Admin audited override.
 
 ### Automatic Routing
@@ -46,8 +53,10 @@ The app now stores and uses `next_role` routing columns. Manual Admin linking is
 | Action | Status | next_role |
 |---|---|---|
 | Utility Head sends draft | Sent for Procurement Review | `procurement_manager` |
-| Procurement submits valid item | Submitted for Approval | `approver` |
-| Approver/Admin approves | Approved / Awaiting Payment | `finance` |
+| Procurement submits a Facility/Utility item at or below ₦100,000 | Submitted for Approval | `procurement_manager` |
+| Procurement submits a Facility/Utility item above ₦100,000 | Submitted for Approval | `approver` |
+| Procurement Manager submits own request | Submitted for Approval | `approver` |
+| Authorized PM/Approver approves | Approved / Awaiting Payment | `finance` |
 | Finance pays/uploads receipt | Paid / Receipt Uploaded | `procurement_manager` |
 | Procurement Manager completes/closes | Completed / Closed | `procurement_manager` then `auditor` |
 | Record archived | Archived | `auditor` |
@@ -94,6 +103,8 @@ Auditor, Admin, Approver, Procurement Manager, Finance, and Utility Head / Facil
 - Visible labels now use **Utility Head / Facility Head**.
 - Generated PDF includes reference number, date, department, movement type, origin, destination, movement date, item details, purpose, transport details, authorization, and security verification.
 - Signature/date/security underlines are generated in aligned tables for consistent spacing.
+- Return Date is active during gateway-pass draft creation and can be stored before submission.
+- After PDF generation, the Facility/Utility workspace safely redirects to History so the generated pass remains visible for preview/download instead of leaving an empty queue.
 - Generated gateway passes leave the ready-to-generate queue but remain in History and reports.
 
 ### Line Items and Other Fields
@@ -384,3 +395,114 @@ This build corrects the Gateway Pass approval handoff and notification routing:
 - The Gateway Pass Ready to Generate queue shows only approved, not-yet-generated passes; after generation, the pass moves to History and remains downloadable.
 - Notification badge logic was aligned with the updated routing so Procurement Manager, Approver / MD, Utility Head / Facility Head, Admin, and Auditor receive the correct workflow notices.
 - The generated Gateway Pass PDF keeps the uploaded CMOTD/RSU-style template layout with logos, title, reference/date, property details, transport details, authorization, and security verification lines.
+
+---
+
+## Logistics Officer Fulfilment Update
+
+This build separates commercial procurement from delivery execution.
+
+**Command chain**
+
+```text
+Facility / Utility Head
+        ↓
+Procurement Manager — review, sourcing, vendor recommendation, PO creation
+        ↓
+Approver / Admin — request and PO approval
+        ↓
+Procurement Manager — commercial release of approved PO to Logistics
+        ↓
+Logistics Officer — delivery planning, tracking, gateway movement coordination,
+                    receiving slips, exceptions, and proof of delivery
+        ↓
+Finance — receipt/invoice/payment review
+        ↓
+Procurement Manager — commercial closure and archive
+```
+
+### Procurement Manager changes
+
+- **Receiving Slips** has been removed from Procurement navigation.
+- **Commercial PO Management** replaces the prior PO/receiving combination.
+- Procurement Manager can create POs, send them for PO approval, and use **Release to Logistics** after PO approval.
+- Procurement Manager retains sourcing, vendor quotes, vendor recommendation, vendor management, commercial PO management, gateway-pass review, and post-payment closure.
+
+### Logistics Officer interface
+
+The new Logistics workspace contains:
+
+- Logistics Dashboard
+- PO Delivery Handover
+- Delivery Tracking
+- Receiving Slips
+- Delivery Exceptions & Returns
+- Gateway Pass Coordination
+- Logistics Documents
+- My Activity History
+- Settings
+
+Logistics cannot source vendors, select suppliers, create a PO, or approve a request/PO/gateway pass.
+
+### Logistics records
+
+The database now stores delivery handover, tracking, driver/vehicle, waybill, proof-of-delivery, receiving, and exception records in a role-safe way. Existing sent/delivery-stage POs are backfilled into the Logistics queue without removing their prior history.
+
+A demo Logistics Officer account is included for the local/demo build:
+
+| Role | Username | Password |
+|---|---:|---:|
+| Logistics Officer | `logistics` | `logistics123` |
+
+Change all demo credentials before production use.
+
+---
+
+## Auditor Evidence Ledger, Security Hardening & Secure Payment Payees
+
+This release adds a read-only **Auditor Evidence Ledger** and secure payment-recipient details without changing normal navigation, workflow actions, or command chains for Admin, Approver, Finance, Logistics, Security, or other roles.
+
+### Auditor evidence coverage
+
+The Auditor workspace now includes a paginated, redacted, append-only ledger plus dedicated read-only evidence views for procurement, sourcing/vendor quotes, POs/logistics, receiving/proof-of-delivery/returns, finance/payments, approvals, gateway passes, notifications, security events, documents, budgets, vendors, and Facility/Utility handoffs.
+
+- Every existing `log_audit(...)` call also writes a tamper-evident ledger event.
+- Database triggers create a transactional evidence backstop for major workflow tables, including requests, sourcing, quotes, POs, payments, gateway passes, receiving slips, logistics exceptions, invoices, receipts, and approval history.
+- Events are redacted, hash-chained, signed, and append-only. Audit events cannot be changed or deleted through the application database connection.
+- Run a manual integrity check with:
+
+```bash
+python -m workers.audit_chain_worker
+```
+
+### Secure request-draft payment payee details
+
+Only the **Procurement Manager** and **Utility/Facility Head** purchase-request draft forms now contain the expandable `Payment Payee / Bank Details` section.
+
+- Account numbers are encrypted at application level.
+- Normal views retain masked names and only the final four account digits.
+- NGN accounts require exactly 10 digits.
+- A requester may state that the payee is not yet known, but the record stays payment-blocked until authorized Finance processing verifies completed details.
+- Existing historical requests without an encrypted payee record remain compatible.
+- Auditors see masked data by default. A temporary sensitive-data reveal requires permission, a reason, and writes its own audit event.
+
+### Production configuration
+
+Copy `.env.example` to `.env` and set these values through a secret manager before setting `PROCUREFLOW_PRODUCTION=1`:
+
+```text
+PROCUREFLOW_PAYEE_ENCRYPTION_KEY=
+PROCUREFLOW_AUDIT_SIGNING_KEY=
+```
+
+New and changed production passwords use Argon2id. Legacy PBKDF2/SHA256 credentials are rehashed on successful login where Argon2 is available. Configure lockout, upload limits, and audit keys through the supplied environment file.
+
+### Migration and deployment notes
+
+The schema is non-destructive and is applied automatically during startup. For an existing database, you may also run:
+
+```bash
+python migrate_existing_db.py
+```
+
+SQLite remains suitable for a local/demo installation. For concurrent production usage, move the repository/service layer to PostgreSQL, place Streamlit behind an HTTPS reverse proxy, use Secure/HttpOnly/SameSite session cookies at the proxy layer, and store files in private object storage with signed downloads.

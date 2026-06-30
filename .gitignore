@@ -4,3 +4,7 @@ __pycache__/
 data/procureflow_workspace.db
 data/attachments/**/*
 !data/attachments/.gitkeep
+# Local encryption key generated only for demo/development mode
+data/.procureflow_local_encryption.key
+# Local environment configuration / secrets
+.env

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import hmac
 import json
 import os
 import smtplib
@@ -12,6 +13,8 @@ from pathlib import Path
 from typing import Any, Iterable
 
 import pandas as pd
+
+from services.security_service import audit_signing_key, canonical_json, redact_value
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 DATA_DIR = BASE_DIR / "data"
@@ -60,6 +63,14 @@ def get_conn() -> sqlite3.Connection:
     """
     conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
+    # The audit triggers use deterministic Python UDFs. Registering them for
+    # every SQLite connection keeps trigger-based evidence transactional.
+    try:
+        conn.create_function("pf_audit_hash", 2, _sqlite_audit_hash)
+        conn.create_function("pf_audit_signature", 1, _sqlite_audit_signature)
+        conn.create_function("pf_audit_now", 0, now_iso)
+    except Exception:
+        pass
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA busy_timeout = 30000")
     try:
@@ -72,26 +83,34 @@ def get_conn() -> sqlite3.Connection:
 
 def run_query(query: str, params: Iterable[Any] = (), fetch: bool = False, many: bool = False):
     conn = get_conn()
-    cur = conn.cursor()
-    if many:
-        cur.executemany(query, params)
-    else:
-        cur.execute(query, tuple(params))
-    rows = cur.fetchall() if fetch else None
-    conn.commit()
-    conn.close()
-    return rows
-
+    try:
+        cur = conn.cursor()
+        if many:
+            cur.executemany(query, params)
+        else:
+            cur.execute(query, tuple(params))
+        rows = cur.fetchall() if fetch else None
+        conn.commit()
+        return rows
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 def run_insert(query: str, params: Iterable[Any] = ()) -> int:
     conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(query, tuple(params))
-    new_id = cur.lastrowid
-    conn.commit()
-    conn.close()
-    return int(new_id)
-
+    try:
+        cur = conn.cursor()
+        cur.execute(query, tuple(params))
+        new_id = cur.lastrowid
+        conn.commit()
+        return int(new_id)
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 def df_query(query: str, params: Iterable[Any] = ()) -> pd.DataFrame:
     conn = get_conn()
@@ -132,6 +151,8 @@ def ensure_performance_indexes():
     indexes = [
         "CREATE INDEX IF NOT EXISTS idx_notifications_user_read_popup ON notifications(user_id, is_read, popup_shown, created_at)",
         "CREATE INDEX IF NOT EXISTS idx_notifications_role_read_popup ON notifications(role, is_read, popup_shown, created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_notifications_section_attention ON notifications(is_read, section_target, created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_notifications_section_role_attention ON notifications(section_target, role, user_id, is_read, created_at)",
         "CREATE INDEX IF NOT EXISTS idx_purchase_requests_status_updated ON purchase_requests(status, updated_at)",
         "CREATE INDEX IF NOT EXISTS idx_purchase_requests_requested_by ON purchase_requests(requested_by, status, updated_at)",
         "CREATE INDEX IF NOT EXISTS idx_purchase_requests_fm_status ON purchase_requests(facility_manager_user_id, status, updated_at)",
@@ -224,6 +245,22 @@ def log_audit(
             (action, entity_type, str(entity_id) if entity_id is not None else None, user_id, details, now_iso()),
         )
 
+
+    # Canonical immutable ledger entry. Legacy audit_logs remain for compatibility,
+    # but every existing call path now also feeds the tamper-evident ledger.
+    append_audit_event(
+        action=action,
+        entity_type=entity_type,
+        entity_id=entity_id,
+        details=details,
+        user_id=user_id,
+        role=role,
+        before_values=before_values,
+        after_values=after_values,
+        outcome="Success",
+        severity="Normal",
+        source="application",
+    )
 
     # Auditor activity feed: every audited action creates an unread Auditor notification.
     # This is intentionally direct SQL instead of create_notification() to avoid recursion.
@@ -793,11 +830,14 @@ def init_db():
     ensure_hardening_schema()
     ensure_finance_document_schema()
     ensure_dashboard_upgrade_schema()
+    ensure_audit_hardening_schema()
     ensure_performance_indexes()
     seed_defaults()
     seed_enterprise_defaults()
     seed_phase2_defaults()
+    ensure_logistics_schema()
     ensure_command_chain_schema()
+    ensure_audit_hardening_schema()
     _DB_INIT_DONE = True
 
 
@@ -970,6 +1010,8 @@ def ensure_enterprise_schema():
         "payments": [
             ("proof_path", "proof_path TEXT"),
             ("finance_note", "finance_note TEXT"),
+            ("approved_by_role", "approved_by_role TEXT"),
+            ("approval_mode", "approval_mode TEXT DEFAULT 'Normal Approval Mode'"),
         ],
         "approval_history": [
             ("approved_by_user_id", "approved_by_user_id INTEGER"),
@@ -1002,6 +1044,7 @@ def seed_enterprise_defaults():
     hash_password = _seed_hash_password
     roles = [
         ("Facility Manager", "Assistant procurement preparation role linked to Procurement Manager"),
+        ("Logistics Officer", "Delivery coordination, receiving, movement documentation and proof-of-delivery management"),
     ]
     for name, desc in roles:
         run_query("INSERT OR IGNORE INTO roles (name, description, created_at) VALUES (?, ?, ?)", (name, desc, now_iso()))
@@ -1029,6 +1072,11 @@ def seed_enterprise_defaults():
             "import_documents_limited", "upload_supporting_documents", "view_own_requests",
             "view_own_activity_history", "communicate_with_procurement_manager",
         ],
+        "Logistics Officer": [
+            "change_password", "view_logistics", "manage_logistics", "receive_goods",
+            "update_delivery_tracking", "record_delivery_exception", "coordinate_gateway_pass",
+            "upload_logistics_documents", "view_logistics_documents", "view_reports",
+        ],
         "Finance": [
             "change_password", "create_request", "record_expense", "review_invoice", "approve_expense",
             "manage_payments", "approve_payment", "manage_budget", "view_reports", "approved_for_payment",
@@ -1043,6 +1091,7 @@ def seed_enterprise_defaults():
 
     demo_users = [
         ("facility", "Facility Manager", "Facility Manager", "facility123"),
+        ("logistics", "Logistics Officer", "Logistics Officer", "logistics123"),
     ]
     for username, full_name, role, pwd in demo_users:
         exists = run_query("SELECT id FROM users WHERE username=?", (username,), fetch=True)
@@ -1151,6 +1200,7 @@ def transition_request_status(
     delegation_reason: str | None = None,
     original_approver_role: str | None = None,
     payment_status: str | None = None,
+    next_role_override: str | None = None,
 ):
     """Move a purchase request through the command chain atomically.
 
@@ -1166,8 +1216,9 @@ def transition_request_status(
         return
 
     old = dict(rows[0])
-    routing = request_routing_for_status(new_status)
+    routing = request_routing_for_status(new_status, old.get("estimated_amount"))
     canonical_status = routing.canonical_status
+    resolved_next_role = next_role_override if next_role_override is not None else routing.next_role
     resolved_payment_status = payment_status if payment_status is not None else routing.payment_status
     cols = table_columns("purchase_requests")
 
@@ -1175,9 +1226,9 @@ def transition_request_status(
     params: list[Any] = [canonical_status, now_iso()]
 
     if "next_role" in cols:
-        if routing.next_role:
+        if resolved_next_role:
             update_bits.append("next_role=?")
-            params.append(routing.next_role)
+            params.append(resolved_next_role)
         else:
             update_bits.append("next_role=NULL")
 
@@ -1200,6 +1251,9 @@ def transition_request_status(
         if "approved_by_role" in cols:
             update_bits.append("approved_by_role=?")
             params.append(actor_role)
+        if "approval_mode" in cols:
+            update_bits.append("approval_mode=?")
+            params.append(approval_mode)
     if canonical_status in {"Paid", "Receipt Uploaded", "Payment Submitted for Verification", "Completed", "Closed", "Archived"} and "paid_at" in cols:
         update_bits.append("paid_at=COALESCE(paid_at, ?)")
         params.append(now_iso())
@@ -1243,14 +1297,14 @@ def transition_request_status(
         actor_user_id,
         actor_role,
         before_values={"status": old.get("status"), "next_role": old.get("next_role")},
-        after_values={"status": canonical_status, "next_role": routing.next_role, "payment_status": resolved_payment_status},
+        after_values={"status": canonical_status, "next_role": resolved_next_role, "payment_status": resolved_payment_status, "approval_mode": approval_mode},
     )
     notify_related_users(
         request_id,
         f"Request {canonical_status}",
         f"{old.get('request_no')} is now {canonical_status}. {note or ''}".strip(),
-        include_finance=(routing.next_role == "finance"),
-        include_procurement=(routing.next_role == "procurement_manager" or canonical_status in {"Returned for Correction"}),
+        include_finance=(resolved_next_role == "finance"),
+        include_procurement=(resolved_next_role == "procurement_manager" or canonical_status in {"Returned for Correction"}),
     )
 
 
@@ -1550,6 +1604,20 @@ def _infer_notification_section(target_role: str | None, title: str | None, enti
         if "draft" in text:
             return "My Draft Requests"
         return "Utility / Facility Dashboard"
+    if role == "Logistics Officer":
+        if "gateway" in text:
+            return "Gateway Pass Coordination"
+        if any(x in text for x in ["exception", "return", "damage", "shortage", "wrong item", "delay"]):
+            return "Delivery Exceptions & Returns"
+        if any(x in text for x in ["receiving", "goods received", "delivery note", "proof of delivery"]):
+            return "Receiving Slips"
+        if any(x in text for x in ["tracking", "in transit", "dispatched", "arrived", "delivery status"]):
+            return "Delivery Tracking"
+        if "document" in text or "waybill" in text:
+            return "Logistics Documents"
+        if "po" in text or "purchase order" in text or "handover" in text:
+            return "PO Delivery Handover"
+        return "Logistics Dashboard"
     if role == "Finance":
         if "invoice" in text:
             return "Invoices"
@@ -1682,7 +1750,8 @@ def seed_defaults():
 
     roles = [
         ("Admin", "System administration and all records"),
-        ("Procurement Manager", "Procurement operations, sourcing, PO and receiving"),
+        ("Procurement Manager", "Commercial procurement, sourcing, vendor recommendation and purchase order management"),
+        ("Logistics Officer", "Delivery coordination, receiving, movement documentation and proof-of-delivery management"),
         ("Finance", "Invoices, payments, expenses, budgets and cash advances"),
         ("Approver", "Executive approval and decision workflow"),
         ("Auditor", "Read-only audit, compliance and source document review"),
@@ -1698,7 +1767,8 @@ def seed_defaults():
 
     role_map = {
         "Admin": permissions,
-        "Procurement Manager": ["change_password", "create_request", "edit_request", "submit_request", "procurement_review", "create_sourcing", "manage_quotes", "recommend_vendor", "create_po", "receive_goods", "record_expense", "manage_vendor", "import_documents", "view_reports"],
+        "Procurement Manager": ["change_password", "create_request", "edit_request", "submit_request", "procurement_review", "create_sourcing", "manage_quotes", "recommend_vendor", "create_po", "release_po_to_logistics", "manage_vendor", "import_documents", "view_reports"],
+        "Logistics Officer": ["change_password", "view_logistics", "manage_logistics", "receive_goods", "update_delivery_tracking", "record_delivery_exception", "coordinate_gateway_pass", "upload_logistics_documents", "view_logistics_documents", "view_reports"],
         "Finance": ["change_password", "create_request", "record_expense", "review_invoice", "approve_expense", "manage_payments", "approve_payment", "manage_budget", "view_reports"],
         "Approver": ["change_password", "approve_request", "reject_request", "approve_po", "approve_payment", "view_reports"],
         "Auditor": ["change_password", "view_reports", "audit", "read_only_all"],
@@ -1753,6 +1823,9 @@ def ensure_hardening_schema():
     add_column_if_missing("payments", "proof_path", "proof_path TEXT")
     add_column_if_missing("payments", "finance_note", "finance_note TEXT")
     add_column_if_missing("payments", "receipt_id", "receipt_id INTEGER")
+    add_column_if_missing("payments", "next_role", "next_role TEXT")
+    add_column_if_missing("payments", "approved_by_role", "approved_by_role TEXT")
+    add_column_if_missing("payments", "approval_mode", "approval_mode TEXT DEFAULT 'Normal Approval Mode'")
     add_column_if_missing("invoices", "invoice_type", "invoice_type TEXT DEFAULT 'Supplier Invoice'")
     add_column_if_missing("invoices", "document_stage", "document_stage TEXT DEFAULT 'Invoice'")
     add_column_if_missing("invoices", "supplier_invoice_no", "supplier_invoice_no TEXT")
@@ -2279,25 +2352,103 @@ def transition_gateway_pass_status(
     )
 
 
-def transition_payment_status(payment_id: int, new_status: str, note: str | None = None, actor_user_id: int | None = None, actor_role: str | None = None, proof_path: str | None = None):
+def transition_payment_status(
+    payment_id: int,
+    new_status: str,
+    note: str | None = None,
+    actor_user_id: int | None = None,
+    actor_role: str | None = None,
+    proof_path: str | None = None,
+    approval_mode: str = "Normal Approval Mode",
+    delegation_reason: str | None = None,
+    original_approver_role: str | None = None,
+):
+    """Move a payment request and keep approval/audit records in sync.
+
+    The optional approval metadata is used for the Procurement Manager's
+    low-value authority, while ordinary Approver/Admin actions keep the
+    existing normal-approval behaviour.
+    """
     rows = run_query("SELECT * FROM payments WHERE id=?", (payment_id,), fetch=True)
     if not rows:
         return
     old = dict(rows[0])
+    cols = table_columns("payments")
     bits = ["status=?", "updated_at=?"]
     params: list[Any] = [new_status, now_iso()]
+
     if new_status == "Approved":
-        bits.append("approved_by=?"); params.append(actor_user_id)
-    if new_status == "Paid":
-        bits.extend(["paid_by=?", "payment_date=?"]); params.extend([actor_user_id, date.today().isoformat()])
+        if "approved_by" in cols:
+            bits.append("approved_by=?")
+            params.append(actor_user_id)
+        if "approved_by_role" in cols:
+            bits.append("approved_by_role=?")
+            params.append(actor_role)
+        if "approval_mode" in cols:
+            bits.append("approval_mode=?")
+            params.append(approval_mode)
+        if "next_role" in cols:
+            bits.append("next_role='finance'")
+    elif new_status in {"Rejected", "Returned"}:
+        if "next_role" in cols:
+            bits.append("next_role=NULL")
+    elif new_status == "Paid":
+        if "paid_by" in cols:
+            bits.append("paid_by=?")
+            params.append(actor_user_id)
+        if "payment_date" in cols:
+            bits.append("payment_date=?")
+            params.append(date.today().isoformat())
+        if "next_role" in cols:
+            bits.append("next_role='auditor'")
+
     if proof_path:
-        bits.append("proof_path=?"); params.append(proof_path)
-    if note is not None:
-        bits.append("finance_note=?"); params.append(note)
+        bits.append("proof_path=?")
+        params.append(proof_path)
+    if note is not None and "finance_note" in cols:
+        bits.append("finance_note=?")
+        params.append(note)
     params.append(payment_id)
     run_query(f"UPDATE payments SET {', '.join(bits)} WHERE id=?", params)
-    add_workflow_event("Payment", payment_id, f"Payment {new_status}", new_status, note, actor_user_id)
-    log_audit(f"PAYMENT_{new_status.upper().replace(' ','_')}", "Payment", payment_id, note, actor_user_id, actor_role, before_values={"status": old.get("status")}, after_values={"status": new_status})
+
+    action = f"Payment {new_status}"
+    add_workflow_event("Payment", payment_id, action, new_status, note, actor_user_id)
+    create_activity_log(
+        actor_user_id,
+        actor_role,
+        action,
+        "Payment",
+        payment_id,
+        f"{old.get('payment_no')} moved from {old.get('status')} to {new_status}",
+        note,
+        "workflow",
+        old.get("created_by"),
+    )
+    if new_status in {"Approved", "Rejected", "Returned"}:
+        run_query(
+            """
+            INSERT INTO approval_history
+            (entity_type, entity_id, action, status_before, status_after, reason, user_id,
+             approved_by_user_id, approved_by_role, approval_mode, delegation_reason,
+             original_approver_role, note, created_at)
+            VALUES ('Payment', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                payment_id, action, old.get("status"), new_status, note, actor_user_id,
+                actor_user_id, actor_role, approval_mode, delegation_reason,
+                original_approver_role, note, now_iso(),
+            ),
+        )
+    log_audit(
+        f"PAYMENT_{new_status.upper().replace(' ', '_')}",
+        "Payment",
+        payment_id,
+        note,
+        actor_user_id,
+        actor_role,
+        before_values={"status": old.get("status"), "next_role": old.get("next_role")},
+        after_values={"status": new_status, "next_role": "finance" if new_status == "Approved" else None, "approval_mode": approval_mode},
+    )
     if old.get("po_id"):
         run_query("UPDATE purchase_orders SET payment_status=?, updated_at=? WHERE id=?", (new_status, now_iso(), old.get("po_id")))
         req = run_query("SELECT request_id FROM purchase_orders WHERE id=?", (old.get("po_id"),), fetch=True)
@@ -2307,14 +2458,79 @@ def transition_payment_status(payment_id: int, new_status: str, note: str | None
         run_query("UPDATE invoices SET status=? WHERE id=?", ("Paid" if new_status == "Paid" else new_status, old.get("invoice_id")))
 
 
-def transition_po_status(po_id: int, new_status: str, note: str | None = None, actor_user_id: int | None = None, actor_role: str | None = None):
+def transition_po_status(
+    po_id: int,
+    new_status: str,
+    note: str | None = None,
+    actor_user_id: int | None = None,
+    actor_role: str | None = None,
+    approval_mode: str = "Normal Approval Mode",
+    delegation_reason: str | None = None,
+    original_approver_role: str | None = None,
+):
+    """Move a purchase order and persist its authority/audit trail."""
     rows = run_query("SELECT * FROM purchase_orders WHERE id=?", (po_id,), fetch=True)
     if not rows:
         return
     old = dict(rows[0])
-    run_query("UPDATE purchase_orders SET status=?, approved_by=CASE WHEN ?='Approved' THEN ? ELSE approved_by END, approved_by_role=CASE WHEN ?='Approved' THEN ? ELSE approved_by_role END, updated_at=? WHERE id=?", (new_status, new_status, actor_user_id, new_status, actor_role, now_iso(), po_id))
-    add_workflow_event("Purchase Order", po_id, f"PO {new_status}", new_status, note, actor_user_id)
-    log_audit(f"PO_{new_status.upper().replace(' ','_')}", "Purchase Order", po_id, note, actor_user_id, actor_role, before_values={"status": old.get("status")}, after_values={"status": new_status})
+    cols = table_columns("purchase_orders")
+    bits = ["status=?", "updated_at=?"]
+    params: list[Any] = [new_status, now_iso()]
+    if new_status == "Approved":
+        if "approved_by" in cols:
+            bits.append("approved_by=?")
+            params.append(actor_user_id)
+        if "approved_by_role" in cols:
+            bits.append("approved_by_role=?")
+            params.append(actor_role)
+        if "approval_mode" in cols:
+            bits.append("approval_mode=?")
+            params.append(approval_mode)
+        if "next_role" in cols:
+            bits.append("next_role='procurement_manager'")
+    elif new_status in {"Rejected", "Returned", "Cancelled"} and "next_role" in cols:
+        bits.append("next_role=NULL")
+    params.append(po_id)
+    run_query(f"UPDATE purchase_orders SET {', '.join(bits)} WHERE id=?", params)
+
+    action = f"PO {new_status}"
+    add_workflow_event("Purchase Order", po_id, action, new_status, note, actor_user_id)
+    create_activity_log(
+        actor_user_id,
+        actor_role,
+        action,
+        "Purchase Order",
+        po_id,
+        f"{old.get('po_no')} moved from {old.get('status')} to {new_status}",
+        note,
+        "workflow",
+        old.get("created_by"),
+    )
+    if new_status in {"Approved", "Rejected", "Returned"}:
+        run_query(
+            """
+            INSERT INTO approval_history
+            (entity_type, entity_id, action, status_before, status_after, reason, user_id,
+             approved_by_user_id, approved_by_role, approval_mode, delegation_reason,
+             original_approver_role, note, created_at)
+            VALUES ('Purchase Order', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                po_id, action, old.get("status"), new_status, note, actor_user_id,
+                actor_user_id, actor_role, approval_mode, delegation_reason,
+                original_approver_role, note, now_iso(),
+            ),
+        )
+    log_audit(
+        f"PO_{new_status.upper().replace(' ', '_')}",
+        "Purchase Order",
+        po_id,
+        note,
+        actor_user_id,
+        actor_role,
+        before_values={"status": old.get("status"), "next_role": old.get("next_role")},
+        after_values={"status": new_status, "next_role": "procurement_manager" if new_status == "Approved" else None, "approval_mode": approval_mode},
+    )
 
 
 # ---------------- Phase 4 dashboard/session/receipt UX upgrades ----------------
@@ -2426,6 +2642,7 @@ def ensure_command_chain_schema():
             ("approved_at", "approved_at TEXT"),
             ("approved_by_user_id", "approved_by_user_id INTEGER"),
             ("approved_by_role", "approved_by_role TEXT"),
+            ("approval_mode", "approval_mode TEXT DEFAULT 'Normal Approval Mode'"),
             ("paid_at", "paid_at TEXT"),
             ("receipt_uploaded_at", "receipt_uploaded_at TEXT"),
             ("completed_at", "completed_at TEXT"),
@@ -2446,6 +2663,8 @@ def ensure_command_chain_schema():
         "payments": [
             ("next_role", "next_role TEXT"),
             ("submitted_for_verification_at", "submitted_for_verification_at TEXT"),
+            ("approved_by_role", "approved_by_role TEXT"),
+            ("approval_mode", "approval_mode TEXT DEFAULT 'Normal Approval Mode'"),
         ],
         "audit_logs": [
             ("amount", "amount REAL"),
@@ -2503,22 +2722,35 @@ def ensure_command_chain_schema():
     # Backfill next_role for common legacy statuses.
     try:
         run_query("UPDATE purchase_requests SET next_role='procurement_manager' WHERE status IN ('Submitted','Submitted to Procurement Manager','Sent for Procurement Review') AND (next_role IS NULL OR next_role='')")
-        run_query("UPDATE purchase_requests SET next_role='approver' WHERE status IN ('Pending Approval','Pending Approver/MD Approval','Submitted for Approval') AND (next_role IS NULL OR next_role='')")
+        # Monetary approval routing is authoritative for all pending records,
+        # including records created before this policy was introduced.
+        run_query("UPDATE purchase_requests SET next_role='procurement_manager' WHERE status IN ('Pending Approval','Pending Approver/MD Approval','Submitted for Approval') AND COALESCE(estimated_amount,0) <= ?", (100000.0,))
+        # A PM-created request is independently approved by Approver / MD even
+        # below the normal threshold, preventing the requester from approving
+        # their own request.
+        run_query("UPDATE purchase_requests SET next_role='approver' WHERE status IN ('Pending Approval','Pending Approver/MD Approval','Submitted for Approval') AND COALESCE(estimated_amount,0) <= ? AND requested_by IN (SELECT id FROM users WHERE role='Procurement Manager')", (100000.0,))
+        run_query("UPDATE purchase_requests SET next_role='approver' WHERE status IN ('Pending Approval','Pending Approver/MD Approval','Submitted for Approval') AND COALESCE(estimated_amount,0) > ?", (100000.0,))
         run_query("UPDATE purchase_requests SET next_role='finance', payment_status=COALESCE(NULLIF(payment_status,''),'Approved for Payment') WHERE status IN ('Approved','Approved for Payment','Awaiting Payment') AND (next_role IS NULL OR next_role='')")
         run_query("UPDATE purchase_requests SET next_role='procurement_manager' WHERE status IN ('Paid','Receipt Uploaded','Payment Submitted for Verification','Completed') AND (next_role IS NULL OR next_role='')")
         run_query("UPDATE purchase_requests SET next_role='auditor' WHERE status IN ('Closed','Archived') AND (next_role IS NULL OR next_role='')")
         run_query("UPDATE gateway_passes SET next_role='procurement_manager' WHERE status IN ('Submitted','Pending Procurement Manager / Approver Review','Sent for Procurement Review','Reviewed by Procurement') AND (next_role IS NULL OR next_role='')")
         run_query("UPDATE gateway_passes SET next_role='approver' WHERE status IN ('Submitted for Approval','Pending Approval') AND (next_role IS NULL OR next_role='')")
         run_query("UPDATE gateway_passes SET next_role='facility_manager' WHERE status='Approved' AND (next_role IS NULL OR next_role='')")
+        run_query("UPDATE purchase_orders SET next_role='procurement_manager' WHERE status='Pending Approval' AND COALESCE(total_amount,0) <= ?", (100000.0,))
+        run_query("UPDATE purchase_orders SET next_role='approver' WHERE status='Pending Approval' AND COALESCE(total_amount,0) > ?", (100000.0,))
+        run_query("UPDATE payments SET next_role='procurement_manager' WHERE status='Pending Approval' AND COALESCE(amount,0) <= ?", (100000.0,))
+        run_query("UPDATE payments SET next_role='approver' WHERE status='Pending Approval' AND COALESCE(amount,0) > ?", (100000.0,))
     except Exception:
         pass
 
     # Correct role descriptions and DB permissions without deleting users.
     run_query("INSERT OR IGNORE INTO roles (name, description, created_at) VALUES ('Facility Manager', 'Utility Head / Facility Head role for drafts, gateway passes and facility/utility handoff', ?)", (now_iso(),))
     run_query("UPDATE roles SET description='Utility Head / Facility Head role for drafts, gateway passes and facility/utility handoff' WHERE name='Facility Manager'")
+    run_query("INSERT OR IGNORE INTO roles (name, description, created_at) VALUES ('Logistics Officer', 'Delivery coordination, receiving, movement documentation, exceptions and proof-of-delivery management', ?)", (now_iso(),))
+    run_query("UPDATE roles SET description='Delivery coordination, receiving, movement documentation, exceptions and proof-of-delivery management' WHERE name='Logistics Officer'")
 
     # Remove unsafe permissions and rebuild baseline role permissions.
-    for role in ["Admin", "Procurement Manager", "Facility Manager", "Finance", "Approver", "Auditor"]:
+    for role in ["Admin", "Procurement Manager", "Facility Manager", "Logistics Officer", "Finance", "Approver", "Auditor"]:
         allowed = safe_role_permissions(role)
         try:
             run_query("DELETE FROM role_permissions WHERE role_name=?", (role,))
@@ -2545,3 +2777,561 @@ def ensure_command_chain_schema():
             )
     except Exception:
         pass
+
+
+# ---------------- Logistics fulfilment workspace schema ----------------
+
+def ensure_logistics_schema():
+    """Add the non-destructive fulfilment layer used by Logistics Officer.
+
+    Procurement remains responsible for commercial sourcing, vendor choice and
+    purchase-order release. Logistics owns the post-release delivery, receiving,
+    exception and movement-documentation record.
+    """
+    from core.permissions import safe_role_permissions
+
+    migrations = {
+        "purchase_orders": [
+            ("next_role", "next_role TEXT"),
+            ("released_to_logistics_at", "released_to_logistics_at TEXT"),
+            ("released_to_logistics_by", "released_to_logistics_by INTEGER"),
+            ("logistics_status", "logistics_status TEXT DEFAULT 'Not Released'"),
+            ("vendor_delivery_contact", "vendor_delivery_contact TEXT"),
+            ("delivery_address", "delivery_address TEXT"),
+            ("driver_name", "driver_name TEXT"),
+            ("driver_phone", "driver_phone TEXT"),
+            ("vehicle_number", "vehicle_number TEXT"),
+            ("waybill_number", "waybill_number TEXT"),
+            ("delivery_instructions", "delivery_instructions TEXT"),
+            ("actual_delivery_date", "actual_delivery_date TEXT"),
+            ("delivery_updated_at", "delivery_updated_at TEXT"),
+            ("delivery_updated_by", "delivery_updated_by INTEGER"),
+            ("delivery_exception_status", "delivery_exception_status TEXT DEFAULT 'None'"),
+        ],
+        "receiving_slips": [
+            ("logistics_officer_id", "logistics_officer_id INTEGER"),
+            ("proof_of_delivery_path", "proof_of_delivery_path TEXT"),
+        ],
+        "gateway_passes": [
+            ("logistics_status", "logistics_status TEXT DEFAULT 'Not Coordinated'"),
+            ("logistics_movement_date", "logistics_movement_date TEXT"),
+            ("logistics_delivery_reference", "logistics_delivery_reference TEXT"),
+            ("logistics_waybill_number", "logistics_waybill_number TEXT"),
+            ("logistics_note", "logistics_note TEXT"),
+            ("logistics_updated_by", "logistics_updated_by INTEGER"),
+            ("logistics_updated_at", "logistics_updated_at TEXT"),
+        ],
+    }
+    for table, columns in migrations.items():
+        for column, ddl in columns:
+            try:
+                add_column_if_missing(table, column, ddl)
+            except Exception:
+                pass
+
+    run_query(
+        """
+        CREATE TABLE IF NOT EXISTS logistics_exceptions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            exception_no TEXT UNIQUE NOT NULL,
+            po_id INTEGER NOT NULL,
+            request_id INTEGER,
+            exception_type TEXT NOT NULL,
+            description TEXT NOT NULL,
+            payment_impact INTEGER DEFAULT 0,
+            status TEXT DEFAULT 'Open',
+            raised_by INTEGER,
+            resolved_by INTEGER,
+            resolution_note TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT
+        )
+        """
+    )
+    run_query(
+        """
+        CREATE TABLE IF NOT EXISTS logistics_documents (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            related_entity_type TEXT NOT NULL,
+            related_entity_id INTEGER NOT NULL,
+            po_id INTEGER,
+            gateway_pass_id INTEGER,
+            document_type TEXT NOT NULL,
+            file_name TEXT,
+            file_path TEXT NOT NULL,
+            notes TEXT,
+            uploaded_by INTEGER,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+
+    for sql in [
+        "CREATE INDEX IF NOT EXISTS idx_po_logistics_queue ON purchase_orders(next_role, status, logistics_status, expected_delivery_date)",
+        "CREATE INDEX IF NOT EXISTS idx_logistics_exceptions_po_status ON logistics_exceptions(po_id, status, created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_logistics_documents_entity ON logistics_documents(related_entity_type, related_entity_id, created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_gateway_pass_logistics_status ON gateway_passes(logistics_status, expected_movement_date, updated_at)",
+    ]:
+        try:
+            run_query(sql)
+        except Exception:
+            pass
+
+    # Existing POs that were already sent or awaiting delivery are moved into
+    # the Logistics Officer queue without changing their commercial history.
+    try:
+        run_query(
+            "UPDATE purchase_orders SET next_role='procurement_manager', logistics_status=COALESCE(NULLIF(logistics_status,''), 'Not Released') WHERE status IN ('Draft','Pending Approval','Approved') AND (next_role IS NULL OR next_role='')"
+        )
+        run_query(
+            "UPDATE purchase_orders SET next_role='logistics_officer', logistics_status=CASE WHEN status='Sent to Vendor' THEN 'Scheduled' WHEN status='Awaiting Delivery' THEN 'In Transit' WHEN status='Partially Received' THEN 'Partially Received' WHEN status='Fully Received' THEN 'Delivered' ELSE COALESCE(NULLIF(logistics_status,''), 'Scheduled') END WHERE status IN ('Sent to Vendor','Awaiting Delivery','Partially Received','Fully Received','Disputed','Returned') AND (next_role IS NULL OR next_role='')"
+        )
+    except Exception:
+        pass
+
+    # The role is visible in Admin user management; an administrator creates
+    # the actual user account with the organisation's own username/password.
+    try:
+        run_query(
+            "INSERT OR IGNORE INTO roles (name, description, created_at) VALUES ('Logistics Officer', 'Delivery coordination, receiving, movement documentation, exceptions and proof-of-delivery management', ?)",
+            (now_iso(),),
+        )
+        allowed = safe_role_permissions("Logistics Officer")
+        run_query("DELETE FROM role_permissions WHERE role_name='Logistics Officer'")
+        for permission in allowed:
+            run_query(
+                "INSERT OR IGNORE INTO permissions (name, description, created_at) VALUES (?, ?, ?)",
+                (permission, permission.replace('_', ' ').title(), now_iso()),
+            )
+            run_query(
+                "INSERT OR IGNORE INTO role_permissions (role_name, permission_name, created_at) VALUES ('Logistics Officer', ?, ?)",
+                (permission, now_iso()),
+            )
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Audit evidence ledger and secure payee data extensions
+# ---------------------------------------------------------------------------
+
+AUDIT_CHAIN_VERSION = "v1"
+AUDIT_GENESIS_HASH = "PROCUREFLOW_AUDIT_GENESIS_V1"
+
+
+def _sqlite_audit_hash(previous_hash: str | None, canonical_payload: str | None) -> str:
+    """SQLite UDF used by append-only evidence triggers."""
+    previous = previous_hash or AUDIT_GENESIS_HASH
+    payload = canonical_payload or "{}"
+    return hashlib.sha256(f"{previous}\n{payload}".encode("utf-8")).hexdigest()
+
+
+def _sqlite_audit_signature(record_hash: str | None) -> str:
+    record_hash = record_hash or ""
+    return hmac.new(audit_signing_key(), record_hash.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def _audit_actor(user_id: int | None, role: str | None) -> tuple[str | None, str | None]:
+    if user_id is None:
+        return None, role or "System"
+    try:
+        rows = run_query("SELECT full_name, role FROM users WHERE id=?", (int(user_id),), fetch=True)
+        if rows:
+            return str(rows[0]["full_name"] or ""), role or str(rows[0]["role"] or "")
+    except Exception:
+        pass
+    return None, role or "System"
+
+
+def _append_audit_event_to_conn(
+    conn: sqlite3.Connection,
+    *,
+    action: str,
+    entity_type: str,
+    entity_id: str | int | None = None,
+    details: str | dict | None = None,
+    user_id: int | None = None,
+    role: str | None = None,
+    before_values: dict | None = None,
+    after_values: dict | None = None,
+    outcome: str = "Success",
+    severity: str = "Normal",
+    source: str = "application",
+    correlation_id: str | None = None,
+    entity_reference: str | None = None,
+    parent_entity_type: str | None = None,
+    parent_entity_id: int | None = None,
+    reason_or_comment: str | None = None,
+    ip_address: str | None = None,
+    user_agent: str | None = None,
+    session_id_hash: str | None = None,
+) -> int:
+    """Insert evidence using an already-open transaction connection."""
+    actor_username, actor_role = _audit_actor(user_id, role)
+    safe_details = redact_value(details or {})
+    safe_before = redact_value(before_values or {})
+    safe_after = redact_value(after_values or {})
+    meta = safe_details if isinstance(safe_details, dict) else {"details": safe_details}
+    occurred = now_iso()
+    correlation = correlation_id or make_ref("AUD")
+    canonical = canonical_json({
+        "occurred_at": occurred,
+        "correlation_id": correlation,
+        "entity_type": entity_type,
+        "entity_id": str(entity_id) if entity_id is not None else None,
+        "entity_reference": entity_reference,
+        "parent_entity_type": parent_entity_type,
+        "parent_entity_id": parent_entity_id,
+        "actor_user_id": user_id,
+        "actor_username": actor_username,
+        "actor_role": actor_role,
+        "action": action,
+        "outcome": outcome,
+        "severity": severity,
+        "source": source,
+        "ip_address": ip_address,
+        "user_agent": user_agent,
+        "session_id_hash": session_id_hash,
+        "before": safe_before,
+        "after": safe_after,
+        "metadata": meta,
+        "reason_or_comment": redact_value(reason_or_comment, "reason_or_comment"),
+    })
+    previous = conn.execute("SELECT record_hash FROM audit_events ORDER BY id DESC LIMIT 1").fetchone()
+    previous_hash = str(previous[0]) if previous and previous[0] else AUDIT_GENESIS_HASH
+    record_hash = _sqlite_audit_hash(previous_hash, canonical)
+    signature = _sqlite_audit_signature(record_hash)
+    cur = conn.execute(
+        """
+        INSERT INTO audit_events (
+          occurred_at, correlation_id, entity_type, entity_id, entity_reference,
+          parent_entity_type, parent_entity_id, actor_user_id, actor_username,
+          actor_role, action, outcome, severity, source, ip_address, user_agent,
+          session_id_hash, before_values_redacted_json, after_values_redacted_json,
+          metadata_redacted_json, reason_or_comment, canonical_payload_json,
+          previous_event_hash, record_hash, record_signature, signature_key_version,
+          created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            occurred, correlation, entity_type, str(entity_id) if entity_id is not None else None,
+            entity_reference, parent_entity_type, parent_entity_id, user_id, actor_username,
+            actor_role, action, outcome, severity, source, ip_address, user_agent,
+            session_id_hash, canonical_json(safe_before), canonical_json(safe_after),
+            canonical_json(meta), redact_value(reason_or_comment, "reason_or_comment"), canonical,
+            previous_hash, record_hash, signature, AUDIT_CHAIN_VERSION, occurred,
+        ),
+    )
+    return int(cur.lastrowid)
+
+
+def append_audit_event(
+    *,
+    action: str,
+    entity_type: str,
+    entity_id: str | int | None = None,
+    details: str | dict | None = None,
+    user_id: int | None = None,
+    role: str | None = None,
+    before_values: dict | None = None,
+    after_values: dict | None = None,
+    outcome: str = "Success",
+    severity: str = "Normal",
+    source: str = "application",
+    correlation_id: str | None = None,
+    entity_reference: str | None = None,
+    parent_entity_type: str | None = None,
+    parent_entity_id: int | None = None,
+    reason_or_comment: str | None = None,
+    ip_address: str | None = None,
+    user_agent: str | None = None,
+    session_id_hash: str | None = None,
+) -> int:
+    """Write one immutable, redacted, hash-chained audit event."""
+    conn = get_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        event_id = _append_audit_event_to_conn(
+            conn,
+            action=action,
+            entity_type=entity_type,
+            entity_id=entity_id,
+            details=details,
+            user_id=user_id,
+            role=role,
+            before_values=before_values,
+            after_values=after_values,
+            outcome=outcome,
+            severity=severity,
+            source=source,
+            correlation_id=correlation_id,
+            entity_reference=entity_reference,
+            parent_entity_type=parent_entity_type,
+            parent_entity_id=parent_entity_id,
+            reason_or_comment=reason_or_comment,
+            ip_address=ip_address,
+            user_agent=user_agent,
+            session_id_hash=session_id_hash,
+        )
+        conn.commit()
+        return event_id
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def verify_audit_chain(record_result: bool = True) -> dict[str, Any]:
+    """Verify the append-only chain and record only a redacted security outcome."""
+    conn = get_conn()
+    failures: list[int] = []
+    checked = 0
+    previous_hash = AUDIT_GENESIS_HASH
+    try:
+        rows = conn.execute("SELECT * FROM audit_events ORDER BY id ASC").fetchall()
+        for row in rows:
+            checked += 1
+            payload = str(row["canonical_payload_json"] or "{}")
+            expected_hash = _sqlite_audit_hash(previous_hash, payload)
+            expected_sig = _sqlite_audit_signature(expected_hash)
+            if (
+                str(row["previous_event_hash"] or "") != previous_hash
+                or str(row["record_hash"] or "") != expected_hash
+                or not hmac.compare_digest(str(row["record_signature"] or ""), expected_sig)
+            ):
+                failures.append(int(row["id"]))
+            previous_hash = str(row["record_hash"] or previous_hash)
+    finally:
+        conn.close()
+    result = {"checked": checked, "valid": not failures, "invalid_event_ids": failures, "verified_at": now_iso()}
+    if record_result:
+        status = "Valid" if not failures else "Failed"
+        run_query(
+            "INSERT INTO audit_chain_verifications (verified_at, checked_count, status, invalid_event_ids_json, created_at) VALUES (?, ?, ?, ?, ?)",
+            (result["verified_at"], checked, status, json_dump(failures), now_iso()),
+        )
+        if failures:
+            append_audit_event(
+                action="AUDIT_CHAIN_VERIFICATION_FAILED",
+                entity_type="Security",
+                details={"invalid_event_ids": failures, "checked": checked},
+                outcome="Failure",
+                severity="Critical",
+                source="audit_verifier",
+                reason_or_comment="One or more immutable audit records failed verification.",
+            )
+    return result
+
+
+def _create_generic_audit_trigger(table: str, entity_type: str, reference_expr: str, id_expr: str = "NEW.id") -> None:
+    """Create same-transaction INSERT/UPDATE/DELETE evidence triggers.
+
+    Actor attribution is supplied by `log_audit` when a UI command uses the
+    service layer; triggers act as a safe backstop for direct SQL paths and
+    never capture raw business values.
+    """
+    safe_table = "".join(ch for ch in table if ch.isalnum() or ch == "_")
+    for op, row_ref, operation in (("INSERT", "NEW", "INSERT"), ("UPDATE", "NEW", "UPDATE"), ("DELETE", "OLD", "DELETE")):
+        trigger = f"trg_audit_{safe_table}_{operation.lower()}"
+        ref = reference_expr.replace("NEW.", f"{row_ref}.").replace("OLD.", f"{row_ref}.")
+        ident = id_expr.replace("NEW.", f"{row_ref}.").replace("OLD.", f"{row_ref}.")
+        payload = (
+            f"json_object('table','{safe_table}','operation','{operation}','entity_id',CAST({ident} AS TEXT),'reference',COALESCE({ref},''))"
+        )
+        # The chain calculations are intentionally duplicated because SQLite
+        # triggers cannot bind a SELECT alias into later VALUES expressions.
+        sql = f"""
+        CREATE TRIGGER IF NOT EXISTS {trigger}
+        AFTER {op} ON {safe_table}
+        BEGIN
+            INSERT INTO audit_events (
+              occurred_at, correlation_id, entity_type, entity_id, entity_reference,
+              actor_role, action, outcome, severity, source,
+              before_values_redacted_json, after_values_redacted_json,
+              metadata_redacted_json, canonical_payload_json,
+              previous_event_hash, record_hash, record_signature,
+              signature_key_version, created_at
+            )
+            SELECT
+              pf_audit_now(),
+              'TRG-' || '{safe_table}' || '-' || '{operation}' || '-' || CAST({ident} AS TEXT) || '-' || lower(hex(randomblob(6))),
+              '{entity_type}', CAST({ident} AS TEXT), COALESCE({ref}, ''),
+              'System', 'DATABASE_{operation}', 'Success', 'Normal', 'database_trigger',
+              '{{}}', '{{}}', {payload}, {payload},
+              COALESCE((SELECT record_hash FROM audit_events ORDER BY id DESC LIMIT 1), '{AUDIT_GENESIS_HASH}'),
+              pf_audit_hash(COALESCE((SELECT record_hash FROM audit_events ORDER BY id DESC LIMIT 1), '{AUDIT_GENESIS_HASH}'), {payload}),
+              pf_audit_signature(pf_audit_hash(COALESCE((SELECT record_hash FROM audit_events ORDER BY id DESC LIMIT 1), '{AUDIT_GENESIS_HASH}'), {payload})),
+              '{AUDIT_CHAIN_VERSION}', pf_audit_now();
+        END;
+        """
+        try:
+            run_query(sql)
+        except Exception:
+            # Some optional/legacy tables may not exist during initial boot.
+            pass
+
+
+def ensure_audit_hardening_schema() -> None:
+    """Non-destructive migrations for tamper-evident audit and payee records."""
+    run_query(
+        """
+        CREATE TABLE IF NOT EXISTS audit_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            occurred_at TEXT NOT NULL,
+            correlation_id TEXT NOT NULL,
+            entity_type TEXT NOT NULL,
+            entity_id TEXT,
+            entity_reference TEXT,
+            parent_entity_type TEXT,
+            parent_entity_id INTEGER,
+            actor_user_id INTEGER,
+            actor_username TEXT,
+            actor_role TEXT,
+            action TEXT NOT NULL,
+            outcome TEXT NOT NULL DEFAULT 'Success',
+            severity TEXT NOT NULL DEFAULT 'Normal',
+            source TEXT NOT NULL DEFAULT 'application',
+            ip_address TEXT,
+            user_agent TEXT,
+            session_id_hash TEXT,
+            before_values_redacted_json TEXT,
+            after_values_redacted_json TEXT,
+            metadata_redacted_json TEXT,
+            reason_or_comment TEXT,
+            canonical_payload_json TEXT NOT NULL,
+            previous_event_hash TEXT NOT NULL,
+            record_hash TEXT NOT NULL UNIQUE,
+            record_signature TEXT NOT NULL,
+            signature_key_version TEXT NOT NULL DEFAULT 'v1',
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    run_query(
+        """
+        CREATE TABLE IF NOT EXISTS audit_chain_verifications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            verified_at TEXT NOT NULL,
+            checked_count INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL,
+            invalid_event_ids_json TEXT,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    run_query(
+        """
+        CREATE TABLE IF NOT EXISTS password_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            password_hash TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    run_query(
+        "CREATE INDEX IF NOT EXISTS idx_password_history_user_created ON password_history(user_id, created_at DESC)"
+    )
+    run_query(
+        """
+        CREATE TABLE IF NOT EXISTS payment_payee_details (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            purchase_request_id INTEGER,
+            purchase_order_id INTEGER,
+            vendor_id INTEGER,
+            payee_type TEXT,
+            payee_name_encrypted TEXT,
+            payee_name_masked TEXT,
+            account_name_encrypted TEXT,
+            account_name_masked TEXT,
+            bank_name_encrypted TEXT,
+            bank_name_masked TEXT,
+            account_number_encrypted TEXT,
+            account_number_last4 TEXT,
+            account_number_fingerprint TEXT,
+            currency TEXT DEFAULT 'NGN',
+            payment_reference_encrypted TEXT,
+            contact_email_encrypted TEXT,
+            contact_phone_encrypted TEXT,
+            recipient_known INTEGER NOT NULL DEFAULT 0,
+            payment_readiness_status TEXT DEFAULT 'Pending Payee Details',
+            verification_status TEXT DEFAULT 'Pending',
+            confirmed_by_user_id INTEGER,
+            confirmed_at TEXT,
+            verified_by_user_id INTEGER,
+            verified_at TEXT,
+            rejected_reason_encrypted TEXT,
+            source_attachment_path TEXT,
+            source_attachment_hash TEXT,
+            created_by_user_id INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_by_user_id INTEGER,
+            updated_at TEXT
+        )
+        """
+    )
+    run_query(
+        """
+        CREATE TABLE IF NOT EXISTS payment_payee_detail_versions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            payee_detail_id INTEGER NOT NULL,
+            version_no INTEGER NOT NULL,
+            action TEXT NOT NULL,
+            values_redacted_json TEXT NOT NULL,
+            changed_by_user_id INTEGER,
+            reason TEXT,
+            created_at TEXT NOT NULL,
+            UNIQUE(payee_detail_id, version_no)
+        )
+        """
+    )
+    for sql in [
+        "CREATE INDEX IF NOT EXISTS idx_audit_events_time ON audit_events(occurred_at DESC, id DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_audit_events_actor ON audit_events(actor_user_id, actor_role, occurred_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_audit_events_entity ON audit_events(entity_type, entity_id, occurred_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_audit_events_action ON audit_events(action, outcome, severity, occurred_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_audit_events_correlation ON audit_events(correlation_id)",
+        "CREATE INDEX IF NOT EXISTS idx_payee_request ON payment_payee_details(purchase_request_id, updated_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_payee_fingerprint ON payment_payee_details(account_number_fingerprint)",
+        "CREATE INDEX IF NOT EXISTS idx_payee_versions ON payment_payee_detail_versions(payee_detail_id, version_no DESC)",
+        "CREATE TRIGGER IF NOT EXISTS trg_audit_events_no_update BEFORE UPDATE ON audit_events BEGIN SELECT RAISE(ABORT, 'Audit events are append-only'); END",
+        "CREATE TRIGGER IF NOT EXISTS trg_audit_events_no_delete BEFORE DELETE ON audit_events BEGIN SELECT RAISE(ABORT, 'Audit events are append-only'); END",
+    ]:
+        try:
+            run_query(sql)
+        except Exception:
+            pass
+    # Transactional backstop evidence for high-value workflow tables.
+    specs = [
+        ("purchase_requests", "Purchase Request", "NEW.request_no"),
+        ("purchase_request_items", "Purchase Request Item", "CAST(NEW.request_id AS TEXT)"),
+        ("sourcing_tasks", "Sourcing Task", "NEW.sourcing_no"),
+        ("vendor_quotes", "Vendor Quote", "COALESCE(NEW.vendor_name, 'Vendor Quote')"),
+        ("purchase_orders", "Purchase Order", "NEW.po_no"),
+        ("payments", "Payment", "NEW.payment_no"),
+        ("gateway_passes", "Gateway Pass", "NEW.pass_number"),
+        ("receiving_slips", "Receiving Slip", "NEW.slip_no"),
+        ("logistics_exceptions", "Logistics Exception", "NEW.exception_no"),
+        ("invoices", "Invoice", "COALESCE(NEW.invoice_no, NEW.supplier_invoice_no, 'Invoice')"),
+        ("receipt_records", "Receipt", "COALESCE(NEW.receipt_no, 'Receipt')"),
+        ("approval_history", "Approval History", "CAST(NEW.id AS TEXT)"),
+    ]
+    for table, etype, ref in specs:
+        if table_exists(table):
+            _create_generic_audit_trigger(table, etype, ref)
+
+
+def run_in_transaction(callback):
+    """Execute callback(connection) under a short SQLite write transaction."""
+    conn = get_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        result = callback(conn)
+        conn.commit()
+        return result
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
