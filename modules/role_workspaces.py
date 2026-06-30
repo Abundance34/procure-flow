@@ -5834,25 +5834,84 @@ def receipts_page():
         receipt_details = parsed.get("receipt_details", {}) if parsed else {}
         bank_details = parsed.get("bank_details", {}) if parsed else {}
         vendors = vendor_options(True)
+
+        # A payment is now marked paid separately from its receipt. Finance can
+        # select any paid payment still awaiting a receipt and attach the manual
+        # receipt/upload to that payment here.
+        paid_without_receipt = df_query(
+            """
+            SELECT p.id, p.payment_no, p.request_id, p.po_id, p.vendor_id, p.amount, p.payment_method, p.payment_date,
+                   COALESCE(pr.request_no, '') request_no, COALESCE(po.po_no, '') po_no,
+                   COALESCE(pr.department_project, '') department
+            FROM payments p
+            LEFT JOIN purchase_orders po ON po.id=p.po_id
+            LEFT JOIN purchase_requests pr ON pr.id=COALESCE(p.request_id, po.request_id)
+            WHERE p.status='Paid' AND (p.receipt_id IS NULL OR p.receipt_id='')
+            ORDER BY COALESCE(p.payment_date, p.created_at) DESC, p.id DESC
+            """
+        )
+        payment_options = ["No paid payment selected"]
+        payment_lookup = {}
+        for row in paid_without_receipt.itertuples():
+            reference = row.request_no or row.po_no or "Unlinked payment"
+            label = f"{row.payment_no} | {reference} | {money(row.amount)}"
+            payment_options.append(label)
+            payment_lookup[label] = int(row.id)
+        linked_payment_label = st.selectbox(
+            "Link this receipt to a paid payment (optional)",
+            payment_options,
+            key="receipt_linked_payment_phase4",
+            help="Select the paid item this receipt proves. You can also record a standalone receipt.",
+        )
+        linked_payment = None
+        if linked_payment_label != "No paid payment selected":
+            linked_payment = paid_without_receipt[
+                paid_without_receipt["id"] == payment_lookup[linked_payment_label]
+            ].iloc[0]
+            st.caption(
+                f"Receipt will be attached to {linked_payment['payment_no']} "
+                f"({linked_payment['request_no'] or linked_payment['po_no'] or 'paid item'})."
+            )
+
+        selected_vendor_id = int(linked_payment.get("vendor_id") or 0) if linked_payment is not None else 0
         vendor_name = fields.get("matched_vendor_name") or "No vendor selected"
+        if selected_vendor_id:
+            for name, vendor_id in vendors.items():
+                if vendor_id == selected_vendor_id:
+                    vendor_name = name
+                    break
         vendor_index = list(vendors.keys()).index(vendor_name) if vendor_name in vendors else 0
-        detected_method = fields.get("payment_method") if fields.get("payment_method") in RECEIPT_PAYMENT_METHODS else "Cash"
+
+        linked_method = str(linked_payment.get("payment_method") or "") if linked_payment is not None else ""
+        detected_method = fields.get("payment_method") if fields.get("payment_method") in RECEIPT_PAYMENT_METHODS else (
+            linked_method if linked_method in RECEIPT_PAYMENT_METHODS else "Cash"
+        )
         receipt_type_options = ["Payment Receipt", "Cash Receipt", "Transfer Receipt", "Card Receipt", "POS Receipt", "Cheque Receipt", "Mobile Money Receipt", "Refund Receipt", "Other"]
         receipt_type = selectbox_with_other("Receipt type", receipt_type_options, "receipt_type_phase4", "receipt_type")
         method_index = RECEIPT_PAYMENT_METHODS.index(detected_method) if detected_method in RECEIPT_PAYMENT_METHODS else 0
         payment_method = selectbox_with_other("Payment method", RECEIPT_PAYMENT_METHODS + ["Other"], "receipt_method_phase4", "payment_method", index=method_index)
-        default_pay_date = _parse_date_value(fields.get("date"), date.today())
+        linked_payment_date = linked_payment.get("payment_date") if linked_payment is not None else None
+        default_pay_date = _parse_date_value(fields.get("date") or linked_payment_date, date.today())
+        linked_amount = float(linked_payment.get("amount") or 0) if linked_payment is not None else 0.0
+        default_amount = float(fields.get("total_amount") or linked_amount or 0)
+        departments = department_options()
+        linked_department = str(linked_payment.get("department") or "") if linked_payment is not None else ""
+        default_dept_index = departments.index(linked_department) if linked_department in departments else 0
+        linked_reference = ""
+        if linked_payment is not None:
+            linked_reference = linked_payment.get("request_no") or linked_payment.get("po_no") or linked_payment.get("payment_no") or ""
+        default_purpose = fields.get("description") or (f"Receipt for {linked_reference}" if linked_reference else "")
         with st.form("receipt_record_form_phase4"):
             c1, c2, c3 = st.columns(3)
             payment_date = c1.date_input("Payment date", default_pay_date, key="receipt_payment_date_phase4")
             receipt_no = c2.text_input("Receipt / transaction reference", value=fields.get("receipt_no") or "", key="receipt_no_phase4")
             vendor_label = c3.selectbox("Vendor / Payee", list(vendors.keys()), index=vendor_index, key="receipt_vendor_phase4")
             c4, c5, c6, c7 = st.columns(4)
-            amount = c4.number_input("Amount paid", min_value=0.0, value=float(fields.get("total_amount") or 0), step=1000.0, key="receipt_amount_phase4")
+            amount = c4.number_input("Amount paid", min_value=0.0, value=default_amount, step=1000.0, key="receipt_amount_phase4")
             tax = c5.number_input("VAT/Tax included", min_value=0.0, value=float(fields.get("tax_amount") or 0), step=100.0, key="receipt_tax_phase4")
-            dept = c6.selectbox("Department / Project", department_options(), key="receipt_dept_phase4")
+            dept = c6.selectbox("Department / Project", departments, index=default_dept_index, key="receipt_dept_phase4")
             currency = selectbox_with_other("Currency", ["NGN", "USD", "EUR", "GBP", "Other"], "receipt_currency_phase4", "currency")
-            purpose = st.text_area("Purpose / what was paid for", value=fields.get("description") or "", key="receipt_purpose_phase4")
+            purpose = st.text_area("Purpose / what was paid for", value=default_purpose, key="receipt_purpose_phase4")
             method_data = {}
             st.markdown(f"##### {payment_method} receipt evidence")
             if payment_method == "Cash":
@@ -5901,20 +5960,56 @@ def receipts_page():
             except Exception:
                 dup = pd.DataFrame()
             receipt_ref = receipt_no.strip() or make_ref("RCT")
+            linked_payment_id = int(linked_payment["id"]) if linked_payment is not None else None
+            linked_po_id = None
+            linked_request_id = None
+            if linked_payment is not None:
+                if pd.notna(linked_payment.get("po_id")) and linked_payment.get("po_id"):
+                    linked_po_id = int(linked_payment.get("po_id"))
+                if pd.notna(linked_payment.get("request_id")) and linked_payment.get("request_id"):
+                    linked_request_id = int(linked_payment.get("request_id"))
             rid = run_insert("""
                 INSERT INTO receipt_records (receipt_no, receipt_type, payment_method, payment_date, vendor_id, payer_name, payee_name, amount, tax_amount, currency, purpose, department_project,
-                    cash_received_by, cash_collected_from, cash_denominations, bank_name, account_number, transfer_reference, sender_bank, receiver_bank, card_type, masked_card_number,
+                    linked_payment_id, linked_po_id, cash_received_by, cash_collected_from, cash_denominations, bank_name, account_number, transfer_reference, sender_bank, receiver_bank, card_type, masked_card_number,
                     card_auth_code, pos_terminal_id, pos_merchant_id, pos_rrn, cheque_number, cheque_bank, cheque_due_date, mobile_wallet_provider, mobile_transaction_id,
                     status, file_path, file_hash, ocr_text, ocr_json, duplicate_warning, notes, uploaded_by, created_at, updated_at, detected_document_type, ocr_detected_date, interface_mode)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Recorded', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Recorded', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (receipt_ref, receipt_type, payment_method, payment_date.isoformat(), vendors[vendor_label], user()["full_name"], vendor_label if vendor_label != "No vendor selected" else "", amount, tax, currency, purpose, dept,
-                 method_data.get("cash_received_by"), method_data.get("cash_collected_from"), method_data.get("cash_denominations"), method_data.get("bank_name"), method_data.get("account_number"), method_data.get("transfer_reference"), method_data.get("sender_bank"), method_data.get("receiver_bank"), method_data.get("card_type"), method_data.get("masked_card_number"), method_data.get("card_auth_code"), method_data.get("pos_terminal_id"), method_data.get("pos_merchant_id"), method_data.get("pos_rrn"), method_data.get("cheque_number"), method_data.get("cheque_bank"), method_data.get("cheque_due_date"), method_data.get("mobile_wallet_provider"), method_data.get("mobile_transaction_id"), path, fhash, parsed.get("raw_text", "") if parsed else "", json_dump(parsed) if parsed else "{}", 0 if dup.empty else 1, notes, user()["id"], now_iso(), now_iso(), fields.get("document_type"), fields.get("date"), payment_method))
+                 linked_payment_id, linked_po_id, method_data.get("cash_received_by"), method_data.get("cash_collected_from"), method_data.get("cash_denominations"), method_data.get("bank_name"), method_data.get("account_number"), method_data.get("transfer_reference"), method_data.get("sender_bank"), method_data.get("receiver_bank"), method_data.get("card_type"), method_data.get("masked_card_number"), method_data.get("card_auth_code"), method_data.get("pos_terminal_id"), method_data.get("pos_merchant_id"), method_data.get("pos_rrn"), method_data.get("cheque_number"), method_data.get("cheque_bank"), method_data.get("cheque_due_date"), method_data.get("mobile_wallet_provider"), method_data.get("mobile_transaction_id"), path, fhash, parsed.get("raw_text", "") if parsed else "", json_dump(parsed) if parsed else "{}", 0 if dup.empty else 1, notes, user()["id"], now_iso(), now_iso(), fields.get("document_type"), fields.get("date"), payment_method))
             _save_ocr_attempt("Receipt", rid, parsed or {})
             exp_no = make_ref("EXP")
             run_insert("""INSERT INTO expenses (expense_no, expense_date, category, description, vendor_id, amount, payment_method, project_department, status, receipt_path, receipt_hash, receipt_no, tax_amount, duplicate_warning, requested_by, ocr_text, ocr_json, document_kind, receipt_id, notes, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Approved', ?, ?, ?, ?, ?, ?, ?, ?, 'Receipt', ?, ?, ?)""", (exp_no, payment_date.isoformat(), fields.get("category") or "Other", purpose or receipt_type, vendors[vendor_label], amount, payment_method, dept, path, fhash, receipt_ref, tax, 0 if dup.empty else 1, user()["id"], parsed.get("raw_text", "") if parsed else "", json_dump(parsed) if parsed else "{}", rid, notes, now_iso()))
             add_workflow_event("Receipt", rid, "Receipt Recorded", "Recorded", f"{payment_method} receipt", user()["id"])
             log_audit("RECEIPT_RECORDED", "Receipt", rid, {"payment_method": payment_method, "amount": amount, "payment_date": payment_date.isoformat()}, user()["id"], user()["role"])
-            st.success(f"Receipt saved: {receipt_ref}")
+            if linked_payment_id:
+                run_query(
+                    "UPDATE payments SET receipt_id=?, proof_path=COALESCE(?, proof_path), updated_at=? WHERE id=?",
+                    (rid, path, now_iso(), linked_payment_id),
+                )
+                add_workflow_event(
+                    "Payment",
+                    linked_payment_id,
+                    "Receipt Attached",
+                    "Paid",
+                    f"Receipt {receipt_ref} was recorded separately by Finance.",
+                    user()["id"],
+                )
+                if linked_request_id:
+                    run_query(
+                        "UPDATE purchase_requests SET receipt_uploaded_at=COALESCE(receipt_uploaded_at, ?), updated_at=? WHERE id=?",
+                        (now_iso(), now_iso(), linked_request_id),
+                    )
+                log_audit(
+                    "PAYMENT_RECEIPT_LINKED",
+                    "Payment",
+                    linked_payment_id,
+                    {"receipt_no": receipt_ref, "receipt_id": rid},
+                    user()["id"],
+                    user()["role"],
+                    after_values={"receipt_id": rid, "receipt_status": "Recorded"},
+                )
+            linked_message = f" and linked to payment {linked_payment['payment_no']}" if linked_payment is not None else ""
+            st.success(f"Receipt saved: {receipt_ref}{linked_message}.")
             if not dup.empty: st.warning("Possible duplicate receipt detected.")
             st.rerun()
     elif section == "Receipt Register":
@@ -7619,7 +7714,7 @@ def finance_ready_df() -> pd.DataFrame:
         SELECT 'Purchase Request' entity_type, pr.id entity_id, pr.request_no "Request number", '' "PO number", '' Vendor,
                pr.department_project Department, pr.category Category, pr.estimated_amount Amount,
                COALESCE(ah.approved_by_role, pr.approved_by_role) "Approved by", COALESCE(pr.approved_at, ah.created_at) "Approval date",
-               COALESCE(pr.payment_status,'Approved for Payment') "Current payment status", 'Pay and upload receipt' "Required finance action"
+               COALESCE(pr.payment_status,'Approved for Payment') "Current payment status", 'Mark paid; record receipt separately' "Required finance action"
         FROM purchase_requests pr
         LEFT JOIN approval_history ah ON ah.entity_type='Purchase Request' AND ah.entity_id=pr.id AND ah.status_after='Approved'
         WHERE (pr.next_role='finance' OR pr.status IN ('Approved','Awaiting Payment','Approved for Payment') OR pr.payment_status='Approved for Payment')
@@ -7632,7 +7727,7 @@ def finance_ready_df() -> pd.DataFrame:
         SELECT 'Purchase Order' entity_type, po.id entity_id, COALESCE(pr.request_no,'') "Request number", po.po_no "PO number", COALESCE(v.name,'') Vendor,
                COALESCE(pr.department_project,'') Department, COALESCE(pr.category,'') Category, po.total_amount Amount,
                COALESCE(u.full_name, po.approved_by_role) "Approved by", po.updated_at "Approval date",
-               COALESCE(po.payment_status,'Unpaid') "Current payment status", 'Pay and upload receipt' "Required finance action"
+               COALESCE(po.payment_status,'Unpaid') "Current payment status", 'Mark paid; record receipt separately' "Required finance action"
         FROM purchase_orders po
         LEFT JOIN purchase_requests pr ON pr.id=po.request_id
         LEFT JOIN vendors v ON v.id=po.vendor_id
@@ -7646,7 +7741,7 @@ def finance_ready_df() -> pd.DataFrame:
 
 def approved_for_payment_page():
     st.subheader("Approved for Payment")
-    st.caption("Finance sees only items already approved through the authorized workflow. There are no approval buttons here.")
+    st.caption("Finance sees only items already approved through the authorized workflow. Mark the payment as paid here, then record or upload the receipt separately under Finance → Receipts.")
     if not can_pay(_current_role()):
         st.warning("Only Finance/Admin can record payments."); return
     df = finance_ready_df()
@@ -7660,11 +7755,9 @@ def approved_for_payment_page():
     row = df[(df["entity_id"] == entity_id) & (df["entity_type"] == entity_type)].iloc[0]
     note = st.text_area("Finance note", key=f"finance_note_cmd_{entity_type}_{entity_id}")
     method = st.selectbox("Payment method", RECEIPT_PAYMENT_METHODS if "RECEIPT_PAYMENT_METHODS" in globals() else PAYMENT_METHODS, key=f"finance_method_cmd_{entity_type}_{entity_id}")
-    proof = st.file_uploader("Upload receipt / payment proof", type=["pdf", "jpg", "jpeg", "png"], key=f"finance_proof_cmd_{entity_type}_{entity_id}")
+    st.info("After marking this item paid, use Finance → Receipts to enter or upload the receipt separately.")
     c1, c2 = st.columns(2)
-    if c1.button("Mark Paid + Upload Receipt", type="primary", key=f"finance_paid_cmd_{entity_type}_{entity_id}"):
-        if proof is None:
-            st.error("Upload payment proof/receipt before completing the item."); return
+    if c1.button("Mark Paid", type="primary", key=f"finance_paid_cmd_{entity_type}_{entity_id}"):
         # Backend-only payee readiness guard. It does not add any Finance
         # screen/control: it verifies a requester-confirmed recipient as part
         # of the existing authorized payment action, or blocks only records
@@ -7680,32 +7773,45 @@ def approved_for_payment_page():
             assert_request_payee_payment_ready(request_id_for_payee, int(user()["id"]), str(user()["role"]))
         except PaymentPayeeNotReadyError as exc:
             st.error(str(exc)); return
-        path, _ = save_upload(proof, "payments")
         amount = float(row["Amount"] or 0)
         pno = make_ref("PAY")
         if entity_type == "Purchase Request":
-            pay_id = run_insert("INSERT INTO payments (payment_no, amount, payment_method, payment_date, status, paid_by, notes, proof_path, created_by, created_at, updated_at, next_role) VALUES (?, ?, ?, ?, 'Paid', ?, ?, ?, ?, ?, ?, 'auditor')", (pno, amount, method, date.today().isoformat(), user()["id"], note, path, user()["id"], now_iso(), now_iso()))
-            receipt_no = make_ref("RCT")
-            rid = run_insert("INSERT INTO receipt_records (receipt_no, receipt_type, payment_method, payment_date, amount, purpose, linked_payment_id, status, file_path, notes, uploaded_by, created_at, updated_at) VALUES (?, 'Payment Receipt', ?, ?, ?, ?, ?, 'Recorded', ?, ?, ?, ?, ?)", (receipt_no, method, date.today().isoformat(), amount, row.get("Request number") or pno, pay_id, path, note, user()["id"], now_iso(), now_iso()))
-            run_query("UPDATE payments SET receipt_id=? WHERE id=?", (rid, pay_id))
-            transition_request_status(entity_id, "Paid", "Payment Completed", note or "Finance paid and uploaded receipt.", user()["id"], user()["role"], payment_status="Paid")
-            run_query("UPDATE purchase_requests SET next_role='procurement_manager', paid_at=COALESCE(paid_at, ?), receipt_uploaded_at=? WHERE id=?", (now_iso(), now_iso(), entity_id))
-            create_notification(None, "Procurement Manager", "Paid request ready for closure", f"{row.get('Request number') or 'A request'} has been paid. Please complete, close and archive it.", "Purchase Request", entity_id, "High", ["in_app", "browser_push"], action_label="Post-Payment Closure")
-            _notify_auditors("Payment completed", f"{row.get('Request number') or 'A request'} was paid by Finance and sent to Procurement Manager for closure.", "Purchase Request", entity_id)
+            pay_id = run_insert(
+                "INSERT INTO payments (payment_no, request_id, amount, payment_method, payment_date, status, paid_by, notes, created_by, created_at, updated_at, next_role) VALUES (?, ?, ?, ?, ?, 'Paid', ?, ?, ?, ?, ?, 'auditor')",
+                (pno, entity_id, amount, method, date.today().isoformat(), user()["id"], note, user()["id"], now_iso(), now_iso()),
+            )
+            transition_request_status(entity_id, "Paid", "Payment Completed", note or "Finance marked payment as paid.", user()["id"], user()["role"], payment_status="Paid")
+            run_query(
+                "UPDATE purchase_requests SET next_role='procurement_manager', paid_at=COALESCE(paid_at, ?) WHERE id=?",
+                (now_iso(), entity_id),
+            )
+            create_notification(None, "Procurement Manager", "Paid request ready for closure", f"{row.get('Request number') or 'A request'} has been marked paid. Finance will record the receipt separately.", "Purchase Request", entity_id, "High", ["in_app", "browser_push"], action_label="Post-Payment Closure")
+            _notify_auditors("Payment marked paid", f"{row.get('Request number') or 'A request'} was marked paid by Finance and sent to Procurement Manager for closure.", "Purchase Request", entity_id)
         else:
             po = linked_po_for_payee if linked_po_for_payee is not None else df_query("SELECT * FROM purchase_orders WHERE id=?", (entity_id,)).iloc[0]
-            pay_id = run_insert("INSERT INTO payments (payment_no, po_id, vendor_id, amount, payment_method, payment_date, status, paid_by, notes, proof_path, created_by, created_at, updated_at, next_role) VALUES (?, ?, ?, ?, ?, ?, 'Paid', ?, ?, ?, ?, ?, ?, 'auditor')", (pno, entity_id, po.get("vendor_id"), amount, method, date.today().isoformat(), user()["id"], note, path, user()["id"], now_iso(), now_iso()))
-            receipt_no = make_ref("RCT")
-            rid = run_insert("INSERT INTO receipt_records (receipt_no, receipt_type, payment_method, payment_date, vendor_id, amount, purpose, linked_payment_id, status, file_path, notes, uploaded_by, created_at, updated_at) VALUES (?, 'Payment Receipt', ?, ?, ?, ?, ?, ?, 'Recorded', ?, ?, ?, ?, ?)", (receipt_no, method, date.today().isoformat(), po.get("vendor_id"), amount, row.get("PO number") or pno, pay_id, path, note, user()["id"], now_iso(), now_iso()))
-            run_query("UPDATE payments SET receipt_id=? WHERE id=?", (rid, pay_id))
+            pay_id = run_insert(
+                "INSERT INTO payments (payment_no, po_id, vendor_id, amount, payment_method, payment_date, status, paid_by, notes, created_by, created_at, updated_at, next_role) VALUES (?, ?, ?, ?, ?, ?, 'Paid', ?, ?, ?, ?, ?, 'auditor')",
+                (pno, entity_id, po.get("vendor_id"), amount, method, date.today().isoformat(), user()["id"], note, user()["id"], now_iso(), now_iso()),
+            )
             run_query("UPDATE purchase_orders SET payment_status='Paid', status='Paid', updated_at=? WHERE id=?", (now_iso(), entity_id))
             if po.get("request_id"):
-                transition_request_status(int(po["request_id"]), "Paid", "Payment Completed", note or "PO paid and receipt uploaded.", user()["id"], user()["role"], payment_status="Paid")
-                run_query("UPDATE purchase_requests SET next_role='procurement_manager', paid_at=COALESCE(paid_at, ?), receipt_uploaded_at=? WHERE id=?", (now_iso(), now_iso(), int(po["request_id"])))
-                create_notification(None, "Procurement Manager", "Paid request ready for closure", "A PO-linked request has been paid. Please complete, close and archive it.", "Purchase Request", int(po["request_id"]), "High", ["in_app", "browser_push"], action_label="Post-Payment Closure")
-                _notify_auditors("Payment completed", "A PO-linked request was paid by Finance and sent to Procurement Manager for closure.", "Purchase Request", int(po["request_id"]))
-        log_audit("PAYMENT_COMPLETED", entity_type, entity_id, {"payment_no": pno, "amount": amount, "receipt": path}, user()["id"], user()["role"], after_values={"status": "Paid", "next_role": "procurement_manager"})
-        _rerun_success("Payment recorded and receipt uploaded. Procurement Manager has been notified to complete, close and archive the record.")
+                transition_request_status(int(po["request_id"]), "Paid", "Payment Completed", note or "Finance marked PO payment as paid.", user()["id"], user()["role"], payment_status="Paid")
+                run_query(
+                    "UPDATE purchase_requests SET next_role='procurement_manager', paid_at=COALESCE(paid_at, ?) WHERE id=?",
+                    (now_iso(), int(po["request_id"])),
+                )
+                create_notification(None, "Procurement Manager", "Paid request ready for closure", "A PO-linked request has been marked paid. Finance will record the receipt separately.", "Purchase Request", int(po["request_id"]), "High", ["in_app", "browser_push"], action_label="Post-Payment Closure")
+                _notify_auditors("Payment marked paid", "A PO-linked request was marked paid by Finance and sent to Procurement Manager for closure.", "Purchase Request", int(po["request_id"]))
+        log_audit(
+            "PAYMENT_MARKED_PAID",
+            entity_type,
+            entity_id,
+            {"payment_no": pno, "amount": amount, "receipt_pending": True},
+            user()["id"],
+            user()["role"],
+            after_values={"status": "Paid", "next_role": "procurement_manager", "receipt_status": "Pending Receipt"},
+        )
+        _rerun_success("Payment marked paid. Record or upload the receipt separately under Finance → Receipts.")
     if c2.button("Add finance note only", key=f"finance_note_only_cmd_{entity_type}_{entity_id}"):
         if entity_type == "Purchase Request":
             run_query("UPDATE purchase_requests SET finance_note=?, updated_at=? WHERE id=?", (note, now_iso(), entity_id))

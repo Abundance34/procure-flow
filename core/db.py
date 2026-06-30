@@ -1823,6 +1823,9 @@ def ensure_hardening_schema():
     add_column_if_missing("payments", "proof_path", "proof_path TEXT")
     add_column_if_missing("payments", "finance_note", "finance_note TEXT")
     add_column_if_missing("payments", "receipt_id", "receipt_id INTEGER")
+    # Links a direct purchase-request payment to the request so a receipt
+    # entered later through Finance → Receipts can be attached safely.
+    add_column_if_missing("payments", "request_id", "request_id INTEGER")
     add_column_if_missing("payments", "next_role", "next_role TEXT")
     add_column_if_missing("payments", "approved_by_role", "approved_by_role TEXT")
     add_column_if_missing("payments", "approval_mode", "approval_mode TEXT DEFAULT 'Normal Approval Mode'")
@@ -1848,6 +1851,7 @@ def ensure_hardening_schema():
         "CREATE INDEX IF NOT EXISTS idx_invoices_status_date ON invoices(status, invoice_date, created_at)",
         "CREATE INDEX IF NOT EXISTS idx_invoices_po_vendor ON invoices(po_id, vendor_id, total_amount)",
         "CREATE INDEX IF NOT EXISTS idx_payments_status_method ON payments(status, payment_method, created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_payments_request_receipt ON payments(request_id, receipt_id, status)",
     ]:
         try:
             run_query(sql)

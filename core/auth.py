@@ -10,6 +10,11 @@ from datetime import datetime, timedelta
 import streamlit as st
 
 try:
+    from streamlit_cookies_manager import EncryptedCookieManager
+except Exception:  # pragma: no cover - optional only when dependencies are incomplete
+    EncryptedCookieManager = None  # type: ignore
+
+try:
     from argon2 import PasswordHasher
     from argon2.exceptions import VerifyMismatchError, InvalidHashError
 except Exception:  # pragma: no cover
@@ -20,6 +25,8 @@ from core.db import run_query, now_iso, log_audit, df_query
 
 SESSION_TIMEOUT_MINUTES = int(os.environ.get("PROCUREFLOW_SESSION_TIMEOUT_MINUTES", "60"))
 PRODUCTION_MODE = os.environ.get("PROCUREFLOW_PRODUCTION", "0") == "1"
+SESSION_COOKIE_NAME = "pf_session_token"
+SESSION_COOKIE_MANAGER_KEY = "_pf_session_cookie_manager"
 
 # Stdlib PBKDF2 password hashing. This avoids the passlib/bcrypt 72-byte password
 # error that can occur with newer bcrypt releases while still being much stronger
@@ -173,6 +180,100 @@ def _set_query_param(name: str, value: str | None):
             pass
 
 
+def _session_cookie_password() -> str:
+    """Return stable local/prod key material for the encrypted browser session cookie.
+
+    The browser cookie contains only an opaque server-session token. The
+    server keeps the token hash and still enforces the existing expiry,
+    logout, account-status, and database session checks before restoring a
+    user after a browser refresh.
+    """
+    configured = os.environ.get("PROCUREFLOW_SESSION_COOKIE_SECRET", "").strip()
+    if configured:
+        return configured
+    try:
+        # Reuse the existing protected local/prod key source without storing a
+        # secret in code. A domain separator keeps this independent from the
+        # payee-data encryption purpose.
+        from services.security_service import encryption_key
+        return hashlib.sha256(encryption_key() + b":procureflow-browser-session-cookie").hexdigest()
+    except Exception:
+        # Local fallback only. Fresh installations with the cookie package
+        # will normally take the secure key path above.
+        return hashlib.sha256(b"procureflow-local-session-cookie").hexdigest()
+
+
+def initialize_browser_session_storage() -> bool:
+    """Create the encrypted cookie bridge before authentication is checked.
+
+    Streamlit resets ``st.session_state`` after a full browser refresh. This
+    bridge stores only the opaque, DB-backed session token in an encrypted
+    browser cookie, allowing the same valid user session and current URL
+    section hint to be restored without returning the user to the login page.
+    """
+    if EncryptedCookieManager is None:
+        return True
+    manager = st.session_state.get(SESSION_COOKIE_MANAGER_KEY)
+    if manager is None:
+        try:
+            manager = EncryptedCookieManager(
+                prefix="procureflow_",
+                password=_session_cookie_password(),
+            )
+            st.session_state[SESSION_COOKIE_MANAGER_KEY] = manager
+        except Exception:
+            return True
+    try:
+        if not manager.ready():
+            # Cookie components finish loading on the next frontend cycle.
+            # Stopping here avoids displaying a transient login screen before
+            # the existing browser session can be restored.
+            st.stop()
+    except Exception:
+        return True
+    return True
+
+
+def _browser_cookie_manager():
+    return st.session_state.get(SESSION_COOKIE_MANAGER_KEY)
+
+
+def _browser_session_token() -> str | None:
+    manager = _browser_cookie_manager()
+    if manager is None:
+        return None
+    try:
+        token = manager.get(SESSION_COOKIE_NAME)
+        return str(token) if token else None
+    except Exception:
+        return None
+
+
+def _store_browser_session_token(token: str) -> None:
+    manager = _browser_cookie_manager()
+    if manager is None or not token:
+        return
+    try:
+        manager[SESSION_COOKIE_NAME] = str(token)
+        manager.save()
+    except Exception:
+        # The server-side session remains valid; this only means a full
+        # browser refresh will require a new login on this browser.
+        pass
+
+
+def _clear_browser_session_token() -> None:
+    manager = _browser_cookie_manager()
+    if manager is None:
+        return
+    try:
+        if SESSION_COOKIE_NAME in manager:
+            del manager[SESSION_COOKIE_NAME]
+        manager.save()
+    except Exception:
+        pass
+
+
 def _session_token_hash(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
@@ -197,12 +298,12 @@ def create_persistent_session(user: dict) -> str:
     return token
 
 def restore_user_from_session() -> bool:
-    # Deliberately no URL token fallback. A browser refresh starts a new Streamlit
-    # session and requires authentication unless deployed behind an approved
-    # Secure/HttpOnly cookie session proxy.
-    token = st.session_state.get("pf_session_token")
+    # The opaque token is restored from the encrypted browser cookie after a
+    # full refresh. It is never written to URL query parameters.
+    token = st.session_state.get("pf_session_token") or _browser_session_token()
     if not token:
         return False
+    st.session_state["pf_session_token"] = str(token)
     token_hash = _session_token_hash(str(token))
     rows = run_query(
         """
@@ -241,6 +342,7 @@ def close_persistent_session():
         except Exception:
             pass
     st.session_state.pop("pf_session_token", None)
+    _clear_browser_session_token()
     # pf_section/pf_role are non-sensitive navigation hints only.
 
 def has_permission(permission: str) -> bool:
@@ -328,6 +430,7 @@ def login_panel():
                 token = create_persistent_session(user)
                 if token:
                     st.session_state["pf_session_token"] = token
+                    _store_browser_session_token(token)
                 log_audit("LOGIN", "User", user["id"], "User logged in", user["id"], user.get("role"))
                 st.rerun()
             else:

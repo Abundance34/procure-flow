@@ -1,7 +1,7 @@
 import streamlit as st
 
 from core.db import init_db, df_query, run_query, now_iso
-from core.auth import login_panel, logout_button, require_user
+from core.auth import initialize_browser_session_storage, login_panel, logout_button, require_user
 from modules.role_workspaces import render_app, render_notification_panel
 from core.permissions import display_role
 
@@ -648,6 +648,7 @@ def main():
         initial_sidebar_state="expanded",
     )
     boot_database_once()
+    initialize_browser_session_storage()
 
     if not require_user():
         login_panel()
